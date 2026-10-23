@@ -460,8 +460,6 @@ public class SteamContentClient : IAsyncDisposable
     }
 
     public async Task<IReadOnlyList<Depot>> GetDepotsAsync(
-
-    public async Task<IReadOnlyList<Depot>> GetDepotsAsync(
         AppId appId,
         string branch = default,
         bool resolveSharedDepots = true,
