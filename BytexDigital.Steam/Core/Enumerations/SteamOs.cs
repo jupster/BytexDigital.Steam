@@ -3,11 +3,11 @@ using System.Runtime.InteropServices;
 
 namespace BytexDigital.Steam.Core.Enumerations
 {
-    public class SteamOs
+    public sealed record SteamOs
     {
-        public static SteamOs Windows = new SteamOs("windows");
-        public static SteamOs Linux = new SteamOs("linux");
-        public static SteamOs MacOs = new SteamOs("macos");
+        public static readonly SteamOs Windows = new("windows");
+        public static readonly SteamOs Linux = new("linux");
+        public static readonly SteamOs MacOs = new("macos");
 
         public string Identifier { get; }
 

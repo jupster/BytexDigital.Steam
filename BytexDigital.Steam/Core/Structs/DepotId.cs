@@ -1,11 +1,7 @@
 ﻿namespace BytexDigital.Steam.Core.Structs
 {
-    public struct DepotId
+    public readonly record struct DepotId(uint Id)
     {
-        public uint Id { get; }
-
-        public DepotId(uint id) => Id = id;
-
         public static implicit operator DepotId(uint id) => new DepotId(id);
 
         public static implicit operator uint(DepotId depotId) => depotId.Id;
