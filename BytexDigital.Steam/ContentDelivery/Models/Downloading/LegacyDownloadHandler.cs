@@ -71,7 +71,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 webClient.DownloadProgressChanged += WebClient_DownloadProgressChanged;
                 webClient.DownloadFileCompleted += WebClient_DownloadFileCompleted;
 
-                await webClient.DownloadFileTaskAsync(new Uri(FileUrl), Path.Combine(DownloadDirectory, FileName));
+                await webClient.DownloadFileTaskAsync(
+                    new Uri(FileUrl),
+                    DownloadPathHelper.GetSafePath(DownloadDirectory, FileName));
 
                 State = DownloadHandlerStateEnum.Downloaded;
 
@@ -82,8 +84,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
             catch
             {
-                // In this handler, it's not a total failure if an exception is raised here, so the handler can be reused.
-                State = DownloadHandlerStateEnum.SetUp;
+                State = DownloadHandlerStateEnum.Failed;
+                throw;
             }
         }
 

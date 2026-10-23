@@ -148,14 +148,17 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 if (!filteredFiles.Any())
                 {
+                    State = DownloadHandlerStateEnum.Verified;
                     Logger?.LogTrace("No files to download");
 
-                    if (DownloadComplete != null)
+                    if (VerificationCompleted != null)
                     {
-                        // Wait for all file verified eventhandlers to finish so we don't send events out of order
                         await WaitForEventHandlersAsync(cancellationToken);
 
-                        RunEventHandler(() => DownloadComplete!.Invoke(this, EventArgs.Empty));
+                        RunEventHandler(
+                            () => VerificationCompleted!.Invoke(
+                                this,
+                                new VerificationCompletedArgs(new List<ManifestFile>())));
                     }
 
                     return;
@@ -189,9 +192,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                             new VerificationCompletedArgs(_chunks.Select(x => x.ManifestFile).Distinct().ToList())));
                 }
             }
-            catch (Exception)
+            catch
             {
-                State = DownloadHandlerStateEnum.SetUp;
+                State = DownloadHandlerStateEnum.Failed;
+                throw;
             }
         }
 
@@ -205,6 +209,21 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             try
             {
                 State = DownloadHandlerStateEnum.Downloading;
+                if (_chunks.IsEmpty)
+                {
+                    State = DownloadHandlerStateEnum.Downloaded;
+                    Logger?.LogTrace("No chunks to download");
+
+                    if (DownloadComplete != null)
+                    {
+                        await WaitForEventHandlersAsync(cancellationToken);
+
+                        RunEventHandler(
+                            () => DownloadComplete!.Invoke(this, EventArgs.Empty));
+                    }
+
+                    return;
+                }
 
                 Logger?.LogTrace("Creating Steam CDN server pool");
 
@@ -261,25 +280,30 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     RunEventHandler(() => DownloadComplete!.Invoke(this, EventArgs.Empty));
                 }
             }
+            catch
+            {
+                State = DownloadHandlerStateEnum.Failed;
+                throw;
+            }
             finally
             {
-                if (_fileWriters.Count > 0)
+                try
                 {
-                    Logger?.LogTrace("Disposing all file writers");
+                    if (_fileWriters.Count > 0)
+                    {
+                        Logger?.LogTrace("Disposing all file writers");
 
-                    var disposeTasks = _fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask()));
-
-                    var cancellationTokenSource = new CancellationTokenSource();
-                    var cancellationTcs = new TaskCompletionSource<object>();
-                    cancellationTokenSource.Token.Register(() => cancellationTcs.TrySetCanceled(), false);
-
-                    await Task.WhenAny(Task.WhenAll(disposeTasks), cancellationTcs.Task);
+                        await Task.WhenAll(
+                            _fileWriters.Select(x => x.DisposeAsync().AsTask()));
+                    }
                 }
+                finally
+                {
+                    Logger?.LogTrace("Closing server pool");
 
-                Logger?.LogTrace("Closing server pool");
-                _serverPool?.Close();
-
-                State = DownloadHandlerStateEnum.Failed;
+                    _serverPool?.Close();
+                    _serverPool = null;
+                }
             }
 
             Logger?.LogTrace("Exiting");
@@ -301,6 +325,17 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             CancellationToken cancellationToken)
         {
             var taskFactoriesSource = taskFactories.ToArray();
+
+            if (taskFactoriesSource.Length == 0)
+            {
+                return;
+            }
+
+            if (maxParallel <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxParallel));
+            }
+
             var tasksRunning = new List<Task>(50);
             var index = 0;
 
@@ -323,7 +358,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         private Task VerifyFileAsync(ManifestFile file, string directory, ConcurrentBag<ChunkJob> chunks)
         {
-            var filePath = Path.Combine(directory, file.FileName);
+            var filePath = DownloadPathHelper.GetSafePath(
+                directory,
+                file.FileName);
             var fileDirectory = Path.GetDirectoryName(filePath);
 
             Directory.CreateDirectory(fileDirectory);
@@ -392,62 +429,100 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             return Task.CompletedTask;
         }
 
-        private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
+        private async Task DownloadChunkAsync(ChunkJob chunkJob,CancellationToken cancellationToken)
         {
-            var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
-            var downloadSuccess = false;
-            var writtenBytes = 0;
-            Server server = default;
+        const int maxAttempts = 3;
 
-            do
+        var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
+        var writtenBytes = 0;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            Server server = null;
+
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                server = _serverPool.GetServer(cancellationToken);
 
-                try
-                {
-                    server = _serverPool.GetServer(cancellationToken);
+                writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
+                    DepotId,
+                    chunkJob.InternalChunk,
+                    server,
+                    downloadedData,
+                    _depotKey,
+                    _serverPool.DesignatedProxyServer)
+                    .ConfigureAwait(false);
 
-                    writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
-                            DepotId,
-                            chunkJob.InternalChunk,
-                            server,
-                            downloadedData,
-                            _depotKey,
-                            _serverPool.DesignatedProxyServer)
-                        .ConfigureAwait(false);
+                _serverPool.ReturnServer(server, false);
+                server = null;
 
-                    downloadSuccess = true;
-                }
-                catch (Exception ex)
-                {
-                    Logger?.LogError(ex, $"Failed to download chunk {chunkJob.InternalChunk.ChunkID} for file {chunkJob.ManifestFile.FileName}: {ex.Message}");
-                    _serverPool.ReturnServer(server, true);
-                    server = null;
-                }
-            } while (!downloadSuccess);
-
-            if (server != null) _serverPool.ReturnServer(server, false);
-
-            Logger?.LogTrace("Writing to FileWriter");
-            while (true)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
-                {
-                    await chunkJob.FileWriter.WriteAsync(chunkJob.InternalChunk.Offset, downloadedData[0..writtenBytes])
-                        .ConfigureAwait(false);
-                    
-                    break;
-                }
-                catch
-                {
-                    // ignore
-                }
+                break;
             }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                if (server != null)
+                {
+                    _serverPool.ReturnServer(server, false);
+                }
 
-            Logger?.LogTrace("Completed downloading chunk");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (server != null)
+                {
+                    _serverPool.ReturnServer(server, true);
+                }
+
+                Logger?.LogWarning(
+                    ex,
+                    "Attempt {Attempt} of {MaxAttempts} failed for chunk {ChunkId} in file {FileName}.",
+                    attempt,
+                    maxAttempts,
+                    chunkJob.InternalChunk.ChunkID,
+                    chunkJob.ManifestFile.FileName);
+
+                if (attempt == maxAttempts)
+                {
+                    throw new SteamDownloadException(ex);
+                }
+
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(250 * attempt),
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        try
+        {
+            await chunkJob.FileWriter.WriteAsync(
+                chunkJob.InternalChunk.Offset,
+                downloadedData[0..writtenBytes])
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogError(
+                ex,
+                "Failed to write chunk {ChunkId} to file {FileName}.",
+                chunkJob.InternalChunk.ChunkID,
+                chunkJob.ManifestFile.FileName);
+
+            throw;
+        }
+
+        Logger?.LogTrace("Completed downloading chunk");
+    }
 
         public async ValueTask DisposeAsync()
         {

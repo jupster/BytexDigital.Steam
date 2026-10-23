@@ -84,6 +84,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             catch
             {
                 State = DownloadHandlerStateEnum.Failed;
+                throw;
             }
         }
 
@@ -107,6 +108,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             catch
             {
                 State = DownloadHandlerStateEnum.Failed;
+                throw;
             }
         }
 
