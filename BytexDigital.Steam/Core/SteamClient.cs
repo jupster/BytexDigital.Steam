@@ -13,7 +13,7 @@ using SteamKit = SteamKit2;
 
 namespace BytexDigital.Steam.Core
 {
-    public class SteamClient : IDisposable
+    public sealed class SteamClient : IDisposable
     {
         public enum SteamClientState
         {
@@ -23,6 +23,8 @@ namespace BytexDigital.Steam.Core
         }
 
         private readonly CancellationTokenSource _cancellationTokenSource;
+        private readonly CancellationToken _token;
+        private bool _disposed;
         private readonly AsyncManualResetEvent _clientFaultedEvent = new AsyncManualResetEvent(false);
         private readonly AsyncManualResetEvent _clientReadyEvent = new AsyncManualResetEvent(false);
         private readonly AsyncSemaphore _clientReconnectSemaphore = new AsyncSemaphore(1);
@@ -30,7 +32,7 @@ namespace BytexDigital.Steam.Core
         private readonly SteamAuthenticator _steamAuthenticator;
         internal readonly SteamKit.SteamContent _steamContentHandler;
         internal readonly SteamKit.SteamUser _steamUserHandler;
-        internal AsyncManualResetEvent _licensesReceived = new AsyncManualResetEvent(false);
+        private readonly AsyncManualResetEvent _licensesReceived = new(false);
         private int _logonAttemptsCounter;
         private int _cmAttemptsCounter;
 
@@ -50,7 +52,7 @@ namespace BytexDigital.Steam.Core
         /// </summary>
         public ServerRecord ForcedServer { get; set; }
 
-        public CancellationToken CancellationToken => _cancellationTokenSource.Token;
+        public CancellationToken CancellationToken => _token;
 
         /// <summary>
         ///     Indicates whether the client is ready for any operation.
@@ -65,7 +67,7 @@ namespace BytexDigital.Steam.Core
         /// <summary>
         ///     State of the client. Once in the <see cref="SteamClientState.ShutDown" /> state, it cannot be used anymore.
         /// </summary>
-        public SteamClientState State { get; protected set; } = SteamClientState.Created;
+        public SteamClientState State { get; private set; } = SteamClientState.Created;
 
         public int MaximumLogonAttempts { get; set; } = 1;
         public int MaximumCmServerAttempts { get; set; } = 15;
@@ -75,25 +77,9 @@ namespace BytexDigital.Steam.Core
         internal SteamKit.CallbackManager CallbackManager { get; set; }
         internal IList<SteamKit.SteamApps.LicenseListCallback.License> Licenses { get; set; }
 
-        public SteamClient(SteamCredentials credentials = default) : this(
-            credentials,
-            default,
-            default)
-        {
-        }
-
         public SteamClient(
-            SteamCredentials credentials = default,
-            SteamAuthenticator steamAuthenticator = default) : this(
-            credentials,
-            steamAuthenticator,
-            default)
-        {
-        }
-
-        public SteamClient(
-            SteamCredentials credentials = default,
-            SteamAuthenticator steamAuthenticator = default,
+            SteamCredentials credentials,
+            SteamAuthenticator steamAuthenticator,
             Action<SteamKit.ISteamConfigurationBuilder> steamConfigurationBuilder = default,
             IRegionSpecificServerListProvider serverListProvider = default)
         {
@@ -130,6 +116,7 @@ namespace BytexDigital.Steam.Core
             InternalClient = new SteamKit.SteamClient(configuration);
 
             _cancellationTokenSource = new CancellationTokenSource();
+            _token = _cancellationTokenSource.Token;
             CallbackManager = new SteamKit.CallbackManager(InternalClient);
 
             _steamUserHandler = InternalClient.GetHandler<SteamKit.SteamUser>();
@@ -142,18 +129,25 @@ namespace BytexDigital.Steam.Core
             CallbackManager.Subscribe<SteamKit.SteamUser.LoggedOffCallback>(OnLoggedOff);
             CallbackManager.Subscribe<SteamKit.SteamApps.LicenseListCallback>(OnLicenseList);
 
-            Task.Run(async () => await CallbackManagerHandler());
+            Task.Factory.StartNew(RunCallbacks, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         public void Dispose()
         {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
             State = SteamClientState.ShutDown;
-            
+
             FaultException ??= new SteamClientDisposedException();
-            
+
             _clientFaultedEvent.Set();
             _cancellationTokenSource.Cancel();
-            
+
+            // The cancellation source is disposed by RunCallbacks once its loop has stopped
             InternalClient.Disconnect();
         }
 
@@ -180,10 +174,11 @@ namespace BytexDigital.Steam.Core
         /// <exception cref="SteamClientFaultedException">Client is faulted.</exception>
         public async Task ConnectAsync(CancellationToken cancellationToken = default)
         {
+            // A client that was shut down or faulted can never be reused, so say that
+            // instead of the misleading "already running"
+            if (State == SteamClientState.ShutDown) throw new SteamClientFaultedException(FaultException);
             if (State != SteamClientState.Created) throw new SteamClientAlreadyRunningException();
             State = SteamClientState.Running;
-
-            if (_cancellationTokenSource.IsCancellationRequested) throw new SteamClientDisposedException();
 
             InternalClientAttemptingConnect?.Invoke();
 
@@ -242,7 +237,7 @@ namespace BytexDigital.Steam.Core
                         try
                         {
                             accessToken =
-                                await _steamAuthenticator.GetAccessTokenAsync(_cancellationTokenSource.Token);
+                                await _steamAuthenticator.GetAccessTokenAsync(_token);
 
                             if (string.IsNullOrEmpty(accessToken))
                             {
@@ -261,19 +256,19 @@ namespace BytexDigital.Steam.Core
                                             Authenticator = new SteamAuthenticatorAdapter(_steamAuthenticator),
                                             GuardData = string.IsNullOrEmpty(guardData) ? null : guardData
                                         })
-                                    .WaitAsync(_cancellationTokenSource.Token);
+                                    .WaitAsync(_token);
 
                                 var pollResponse = await authSession.PollingWaitForResultAsync(CancellationToken);
 
                                 accessToken = pollResponse.RefreshToken;
 
                                 await _steamAuthenticator.PersistAccessTokenAsync(accessToken,
-                                    _cancellationTokenSource.Token);
+                                    _token);
 
                                 if (!string.IsNullOrEmpty(pollResponse.NewGuardData))
                                 {
                                     await _steamAuthenticator.PersistGuardDataAsync(pollResponse.NewGuardData,
-                                        _cancellationTokenSource.Token);
+                                        _token);
                                 }
                             }
                         }
@@ -285,7 +280,11 @@ namespace BytexDigital.Steam.Core
                         }
                         catch (Exception ex)
                         {
+                            // Without a token there is nothing to log on with. Report the real cause.
                             OnUnhandledException?.Invoke(this, ex);
+                            SetFaultedAndShutdown(ex);
+
+                            return;
                         }
                         
                         // Don't spam unsuccessful logon attempts as this might get us rate limited
@@ -301,7 +300,7 @@ namespace BytexDigital.Steam.Core
                             {
                                 Username = Credentials.Username,
                                 AccessToken = accessToken,
-                                LoginID = (uint) new Random().Next(100000000, 999999999)
+                                LoginID = (uint) Random.Shared.Next(100000000, 999999999)
                             });
                     });
             }
@@ -311,14 +310,24 @@ namespace BytexDigital.Steam.Core
             }
         }
 
-        private Task CallbackManagerHandler()
+        private void RunCallbacks()
         {
-            while (!_cancellationTokenSource.IsCancellationRequested)
+            try
             {
-                CallbackManager.RunWaitAllCallbacks(TimeSpan.FromMilliseconds(10));
+                while (!_token.IsCancellationRequested)
+                {
+                    CallbackManager.RunWaitAllCallbacks(TimeSpan.FromMilliseconds(10));
+                }
             }
-
-            return Task.CompletedTask;
+            catch (Exception ex)
+            {
+                // An exception in a callback would otherwise end this loop silently and leave a dead client
+                SetFaultedAndShutdown(ex);
+            }
+            finally
+            {
+                _cancellationTokenSource.Dispose();
+            }
         }
 
         private void OnLicenseList(SteamKit.SteamApps.LicenseListCallback callback)
@@ -348,23 +357,46 @@ namespace BytexDigital.Steam.Core
             _ = Task.Run(
                 async () =>
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(1), CancellationToken);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(1), CancellationToken);
 
-                    CancellationToken.ThrowIfCancellationRequested();
+                        // Keep this thread hostage until noone is currently performing work that might change how we sign into Steam, e.g.
+                        // authentication details such as 2FA code
+                        using var lk = await _clientReconnectSemaphore.LockAsync(CancellationToken);
 
-                    // Keep this thread hostage until noone is currently performing work that might change how we sign into Steam, e.g.
-                    // authentication details such as 2FA code
-                    using var lk = await _clientReconnectSemaphore.LockAsync(CancellationToken);
+                        CancellationToken.ThrowIfCancellationRequested();
 
-                    CancellationToken.ThrowIfCancellationRequested();
+                        InternalClientAttemptingConnect?.Invoke();
 
-                    InternalClientAttemptingConnect?.Invoke();
-
-                    InternalClient.Connect(ForcedServer);
+                        InternalClient.Connect(ForcedServer);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // The client was shut down while waiting to reconnect
+                    }
+                    catch (Exception ex)
+                    {
+                        OnUnhandledException?.Invoke(this, ex);
+                    }
                 });
         }
 
+        // The callback manager needs a void method. Everything real happens in HandleLoggedOnAsync,
+        // and this wrapper makes sure no exception escapes, because an exception from an async void method crashes the app.
         private async void OnLoggedOn(SteamKit.SteamUser.LoggedOnCallback callback)
+        {
+            try
+            {
+                await HandleLoggedOnAsync(callback);
+            }
+            catch (Exception ex)
+            {
+                SetFaultedAndShutdown(ex);
+            }
+        }
+
+        private async Task HandleLoggedOnAsync(SteamKit.SteamUser.LoggedOnCallback callback)
         {
             InternalClientLoggedOn?.Invoke();
 
@@ -379,50 +411,38 @@ namespace BytexDigital.Steam.Core
                 _logonAttemptsCounter = 0;
 
                 _clientReadyEvent.Set();
+                return;
             }
-            else
+
+            if (callback.Result == SteamKit.EResult.AccountLogonDenied ||
+                callback.Result == SteamKit.EResult.AccountLoginDeniedNeedTwoFactor)
             {
-                if (callback.Result == SteamKit.EResult.AccountLogonDenied ||
-                    callback.Result == SteamKit.EResult.AccountLoginDeniedNeedTwoFactor)
-                {
-                    // By returning, we are releasing the aquired semaphore. This will make the disconnected
-                    // callback continue it's execution and attempt a reconnect if our client hasn't been marked
-                    // as cancelled/closed.
-                    return;
-                }
-
-                if (callback.Result == SteamKit.EResult.TryAnotherCM)
-                {
-                    // If we get this error code, we should try another CM server to connect to. This one might just be
-                    // down for maintenance. Keep track of how many times we attempted to connect to different CM
-                    // servers to set a limit though.
-                    _cmAttemptsCounter += 1;
-
-                    if (_cmAttemptsCounter < MaximumCmServerAttempts)
-                    {
-                        // Returning here will result in a new connect attempt. It's important we DONT create a new
-                        // SteamKit.SteamClient as it already keeps track of which CM servers were attempted.
-                        return;
-                    }
-                    // ReSharper disable once RedundantIfElseBlock
-                    else
-                    {
-                        SetFaultedAndShutdown(new SteamNoCmServerFoundException());
-
-                        return;
-                    }
-                }
-                
-                // Don't spam unsuccessful logon attempts as this might get us rate limited
-                if (_logonAttemptsCounter > MaximumLogonAttempts)
-                {
-                    SetFaultedAndShutdown(new SteamAuthenticationException(callback.Result));
-
-                    return;
-                }
-
-                SetFaultedAndShutdown(new SteamAuthenticationException(callback.Result));
+                // By returning, we are releasing the aquired semaphore. This will make the disconnected
+                // callback continue it's execution and attempt a reconnect if our client hasn't been marked
+                // as cancelled/closed.
+                return;
             }
+
+            if (callback.Result == SteamKit.EResult.TryAnotherCM)
+            {
+                // If we get this error code, we should try another CM server to connect to. This one might just be
+                // down for maintenance. Keep track of how many times we attempted to connect to different CM
+                // servers to set a limit though.
+                _cmAttemptsCounter += 1;
+
+                if (_cmAttemptsCounter < MaximumCmServerAttempts)
+                {
+                    // Returning here will result in a new connect attempt. It's important we DONT create a new
+                    // SteamKit.SteamClient as it already keeps track of which CM servers were attempted.
+                    return;
+                }
+
+                SetFaultedAndShutdown(new SteamNoCmServerFoundException());
+                return;
+            }
+
+            // Don't spam unsuccessful logon attempts as this might get us rate limited
+            SetFaultedAndShutdown(new SteamAuthenticationException(callback.Result));
         }
 
         private void SetFaultedAndShutdown(Exception exception)
