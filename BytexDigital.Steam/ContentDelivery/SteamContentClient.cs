@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics.CodeAnalysis;
 using BytexDigital.Steam.ContentDelivery.Exceptions;
 using BytexDigital.Steam.ContentDelivery.Models;
 using BytexDigital.Steam.ContentDelivery.Models.Downloading;
@@ -33,9 +34,6 @@ public class SteamContentClient : IAsyncDisposable
     private readonly ConcurrentDictionary<DepotId, byte[]> _depotKeys = new();
 
     // Cache
-    private readonly ConcurrentDictionary<ManifestId, (DateTimeOffset, ulong)> _manifestRequestCodes = new();
-
-    // Cache
     private readonly ConcurrentDictionary<uint, ulong> _packageAccessTokens = new();
 
     // Cache
@@ -54,7 +52,6 @@ public class SteamContentClient : IAsyncDisposable
     internal SteamKit.SteamUser SteamUser { get; }
     internal SteamKit.SteamApps SteamApps { get; }
     internal SteamKit.SteamUnifiedMessages SteamUnifiedMessagesService { get; }
-    internal ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken> CdnAuthenticationTokens { get; }
     internal int MaxConcurrentDownloadsPerTask { get; }
 
     public SteamContentClient(SteamClient steamClient, int maxConcurrentDownloadsPerTask = 10)
@@ -62,7 +59,6 @@ public class SteamContentClient : IAsyncDisposable
         SteamClient = steamClient;
         SteamUnifiedMessagesService = SteamClient.InternalClient.GetHandler<SteamKit.SteamUnifiedMessages>();
         PublishedFileService = SteamUnifiedMessagesService.CreateService<PublishedFile>();
-        CdnAuthenticationTokens = new ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken>();
         MaxConcurrentDownloadsPerTask = maxConcurrentDownloadsPerTask;
         SteamApps = SteamClient.InternalClient.GetHandler<SteamKit.SteamApps>();
         SteamUser = SteamClient.InternalClient.GetHandler<SteamKit.SteamUser>();
@@ -72,19 +68,17 @@ public class SteamContentClient : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        foreach (var pool in _serverPools)
+        foreach (var pool in _serverPools.Values)
         {
-            try
-            {
-                pool.Value.Dispose();
-            }
-            catch
-            {
-                // ignore
-            }
+            pool.Dispose();
         }
 
-        return default;
+        _serverPools.Clear();
+
+        _cancellationTokenSource.Cancel();
+        _cancellationTokenSource.Dispose();
+
+        return ValueTask.CompletedTask;
     }
 
     public async Task<Manifest> GetManifestAsync(
@@ -112,17 +106,13 @@ public class SteamContentClient : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
 
             Server server = default;
+            var healthy = false;
 
             try
             {
                 server = pool.GetServer(cancellationToken);
 
                 var depotKey = await GetDepotKeyAsync(depotId, appId);
-
-                //// Get manifest request code from cache or fetch it and put it into the cache
-                //ulong manifestCode;
-
-                //if (!_manifestRequestCodes.TryGetValue(manifestId., )
 
                 var manifestCode =
                     await SteamClient._steamContentHandler.GetManifestRequestCode(depotId, appId, manifestId)
@@ -132,15 +122,15 @@ public class SteamContentClient : IAsyncDisposable
                     await pool.CdnClient.DownloadManifestAsync(depotId, manifestId, manifestCode, server, depotKey)
                         .WaitAsync(cancellationToken);
 
-
                 if (manifest.FilenamesEncrypted)
                 {
                     manifest.DecryptFilenames(depotKey);
                 }
 
+                healthy = true;
                 return manifest;
             }
-            catch (SteamAccessDeniedException)
+            catch (Exception ex) when (ex is SteamAccessDeniedException or SteamNoContentServerFoundException)
             {
                 throw;
             }
@@ -150,16 +140,10 @@ public class SteamContentClient : IAsyncDisposable
             }
             finally
             {
+                // A server that just worked goes back in the pool. Only one that failed is dropped.
                 if (server != null)
                 {
-                    try
-                    {
-                        pool.ReturnServer(server, true);
-                    }
-                    catch
-                    {
-                        // Ignore for retry logic
-                    }
+                    pool.ReturnServer(server, !healthy);
                 }
 
                 attempts += 1;
@@ -181,21 +165,26 @@ public class SteamContentClient : IAsyncDisposable
 
         if (_serverPools.TryGetValue(appId, out var serverPool))
         {
-            return serverPool;
+            if (!serverPool.IsExhausted)
+            {
+                return serverPool;
+            }
+
+            // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
+            serverPool.Dispose();
         }
 
         serverPool = new SteamCdnServerPool(this, appId);
-
-        _serverPools.TryAdd(appId, serverPool);
+        _serverPools[appId] = serverPool;
 
         return serverPool;
     }
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
     {
-        if (_depotKeys.ContainsKey(depotId))
+        if (_depotKeys.TryGetValue(depotId, out var cachedKey))
         {
-            return _depotKeys[depotId];
+            return cachedKey;
         }
 
         var result = await SteamApps.GetDepotDecryptionKey(depotId, appId);
@@ -210,11 +199,8 @@ public class SteamContentClient : IAsyncDisposable
             throw new SteamDepotKeyNotRetrievableException(depotId, result.Result);
         }
 
-        while (!_depotKeys.TryAdd(depotId, result.DepotKey))
-        {
-        }
-
-        return result.DepotKey;
+        // If another thread stored a key while we were waiting on Steam, keep theirs
+        return _depotKeys.GetOrAdd(depotId, result.DepotKey);
     }
 
     public async Task<PublishedFileDetails> GetPublishedFileDetailsAsync(
@@ -262,8 +248,10 @@ public class SteamContentClient : IAsyncDisposable
         var paginationCursor = "*";
         var items = new List<PublishedFileDetails>();
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var requestDetails = new CPublishedFile_QueryFiles_Request
             {
                 query_type = (uint) SteamKit.EPublishedFileQueryType.RankedByPublicationDate,
@@ -339,7 +327,7 @@ public class SteamContentClient : IAsyncDisposable
 
         manifestId ??= publishedFileDetails.hcontent_file;
 
-        if (!manifestId.HasValue || manifestId.Value == 0)
+        if (!manifestId.HasValue || manifestId.Value.Id == 0)
         {
             throw new SteamAccessDeniedException(
                 "Cannot download workshop item because no manifest id was found (Maybe you don't have access to this workshop).");
@@ -368,7 +356,7 @@ public class SteamContentClient : IAsyncDisposable
         depotIdCondition ??= x => true;
         depots = depots.Where(x => depotIdCondition.Invoke(x)).ToList();
 
-        if (depots == null)
+        if (depots.Count == 0)
         {
             throw new SteamDownloadCriteriaHaveNoResultException(
                 "No depot to download found that matches the criteria.");
@@ -401,7 +389,7 @@ public class SteamContentClient : IAsyncDisposable
                 {
                     if (branchPassword == null)
                     {
-                        throw new SteamInvalidBranchPasswordException(appId, depot.Id, branch, branchPassword);
+                        throw new SteamInvalidBranchPasswordException(appId, depot.Id, branch);
                     }
 
 
@@ -463,6 +451,16 @@ public class SteamContentClient : IAsyncDisposable
             cancellationToken);
     }
 
+    private static SteamKit.KeyValue GetDepotsSection(
+        SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo appInfo,
+        AppId appId)
+    {
+        return appInfo.KeyValues.Children.FirstOrDefault(x => x.Name == "depots")
+               ?? throw new SteamDepotNotFoundException($"App {appId} has no depot information.");
+    }
+
+    public async Task<IReadOnlyList<Depot>> GetDepotsAsync(
+
     public async Task<IReadOnlyList<Depot>> GetDepotsAsync(
         AppId appId,
         string branch = default,
@@ -473,14 +471,14 @@ public class SteamContentClient : IAsyncDisposable
         {
             // Check if the branch exists.
             if ((await GetBranchesAsync(appId, cancellationToken)).All(
-                    b => b.Name.ToLowerInvariant() != branch.ToLowerInvariant()))
+                    b => !string.Equals(b.Name, branch, StringComparison.OrdinalIgnoreCase)))
             {
                 throw new SteamBranchNotFoundException(appId, branch);
             }
         }
 
         var appInfo = await GetAppInfoAsync(appId, cancellationToken);
-        var allDepotData = appInfo.KeyValues.Children.First(x => x.Name == "depots");
+        var allDepotData = GetDepotsSection(appInfo, appId);
         var filteredDepotData = new List<SteamKit.KeyValue>();
         var parsedDepots = new List<Depot>();
 
@@ -503,10 +501,10 @@ public class SteamContentClient : IAsyncDisposable
 
             // If this is a shared install, fetch the depot data separately, because this "link" to the actual depot
             // will not contain any manifests!
-            if (isSharedInstall && resolveSharedDepots)
+            if (isSharedInstall && resolveSharedDepots && depotFromApp.HasValue)
             {
                 var sharedAppInfo = await GetAppInfoAsync(depotFromApp!.Value, cancellationToken);
-                var sharedAppInfoDepots = sharedAppInfo.KeyValues.Children.First(x => x.Name == "depots");
+                var sharedAppInfoDepots = GetDepotsSection(sharedAppInfo, depotFromApp.Value);
 
                 foreach (var sharedAppInfoDepot in sharedAppInfoDepots.Children)
                 {
@@ -564,7 +562,7 @@ public class SteamContentClient : IAsyncDisposable
                 }
                 else
                 {
-                    configEntries.Add(configEntry.Name, configEntry.Value);
+                    configEntries[configEntry.Name] = configEntry.Value;
                 }
             }
 
@@ -612,11 +610,11 @@ public class SteamContentClient : IAsyncDisposable
             if (branch != default)
             {
                 manifests = manifests
-                    .Where(x => x.BranchName.ToLowerInvariant() == branch.ToLowerInvariant())
+                    .Where(x => string.Equals(x.BranchName, branch, StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
                 encryptedManifests = encryptedManifests
-                    .Where(x => x.BranchName.ToLowerInvariant() == branch.ToLowerInvariant())
+                    .Where(x => string.Equals(x.BranchName, branch, StringComparison.OrdinalIgnoreCase))
                     .ToList();
             }
 
@@ -671,7 +669,7 @@ public class SteamContentClient : IAsyncDisposable
         await ValidateBranchPasswordAsync(
             depots.SelectMany(
                 x => x.EncryptedManifests.Where(
-                    m => m.BranchName.ToLowerInvariant() == branch.ToLowerInvariant())),
+                    m => string.Equals(m.BranchName, branch, StringComparison.OrdinalIgnoreCase))),
             branchPassword);
     }
 
@@ -695,7 +693,7 @@ public class SteamContentClient : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var appInfo = await GetAppInfoAsync(appId, cancellationToken);
-        var depots = appInfo.KeyValues.Children.First(x => x.Name == "depots");
+        var depots = GetDepotsSection(appInfo, appId);
         var branches = depots["branches"];
 
         var parsedBranches = new List<Branch>();
@@ -720,28 +718,16 @@ public class SteamContentClient : IAsyncDisposable
         return parsedBranches;
     }
 
+    [SuppressMessage("Security", "S5542", Justification = "Steam encrypts branch manifest ids with AES-ECB. The format is fixed by Steam.")]
+    [SuppressMessage("Security", "CA5358", Justification = "Same reason: AES-ECB is dictated by Steam.")]
+
     public async Task<DepotManifest> DecryptDepotManifestAsync(
         DepotEncryptedManifest manifest,
         string branchPassword)
     {
         if (manifest.Version == DepotEncryptedManifest.EncryptionVersion.V1)
         {
-            //  var manifestCryptoInput = DecodeHexString(manifest.EncryptedManifestId);
-            //  var manifestIdBytes =
-            //      SteamKit.CryptoHelper.VerifyAndDecryptPassword(manifestCryptoInput, branchPassword);
-            //
-            //  if (manifestIdBytes == null)
-            //  {
-            //      throw new SteamInvalidBranchPasswordException(
-            //          manifest.AppId,
-            //          manifest.DepotId,
-            //          manifest.BranchName,
-            //          branchPassword);
-            //  }
-            //
-            // return new DepotManifest(manifest.BranchName, BitConverter.ToUInt64(manifestIdBytes));
-
-            throw new NotImplementedException();
+            throw new NotSupportedException("Version 1 encrypted manifests are not supported.");
         }
         else
         {
@@ -752,8 +738,7 @@ public class SteamContentClient : IAsyncDisposable
                 throw new SteamInvalidBranchPasswordException(
                     manifest.AppId,
                     manifest.DepotId,
-                    manifest.BranchName,
-                    branchPassword);
+                    manifest.BranchName);
             }
 
             var encryptedManifestIdBytes = DecodeHexString(manifest.EncryptedManifestId);
@@ -785,12 +770,9 @@ public class SteamContentClient : IAsyncDisposable
                     manifest.AppId,
                     manifest.DepotId,
                     manifest.BranchName,
-                    branchPassword,
                     ex);
             }
         }
-
-        throw new NotImplementedException();
     }
 
     public async Task<ManifestId> GetDepotManifestIdAsync(
@@ -836,7 +818,7 @@ public class SteamContentClient : IAsyncDisposable
         {
             if (branchPassword == null)
             {
-                throw new SteamInvalidBranchPasswordException(appId, depotId, branch, branchPassword);
+                throw new SteamInvalidBranchPasswordException(appId, depotId, branch);
             }
 
             manifest = await DecryptDepotManifestAsync(encryptedManifest, branchPassword);
@@ -868,7 +850,7 @@ public class SteamContentClient : IAsyncDisposable
         if (isUserGeneratedContent)
         {
             var appInfo = await GetAppInfoAsync(appId, cancellationToken);
-            var depotsRaw = appInfo.KeyValues.Children.First(x => x.Name == "depots");
+            var depotsRaw = GetDepotsSection(appInfo, appId);
 
             depotId = depotsRaw["workshopdepot"].AsUnsignedInteger();
 
@@ -969,7 +951,7 @@ public class SteamContentClient : IAsyncDisposable
     {
         var result = await GetAppProductInfoAsync(new List<AppId> { appId }, false, cancellationToken);
 
-        return result.First(x => x.ID == appId);
+        return result.First(x => x.ID == appId.Id);
     }
 
     internal async Task<List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>> GetAppProductInfoAsync(
@@ -1001,11 +983,18 @@ public class SteamContentClient : IAsyncDisposable
                 });
         }
 
+        // Everything was in the cache, so there is nothing to ask Steam
+        if (appRequests.Count == 0)
+        {
+            return productInfos;
+        }
+
         var result = await SteamApps.PICSGetProductInfo(appRequests, new List<SteamKit.SteamApps.PICSRequest>())
             .ToTask()
             .WaitAsync(cancellationToken);
 
-        foreach (var (key, value) in result.Results!.First().Apps)
+        // Steam can split a big answer into several parts, so read all of them
+        foreach (var (key, value) in result.Results!.SelectMany(r => r.Apps))
         {
             _appProductInfos.AddOrUpdate(key, value, (ek, ev) => value);
             productInfos.Add(value);
@@ -1014,42 +1003,49 @@ public class SteamContentClient : IAsyncDisposable
         return productInfos;
     }
 
-    internal async Task<List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>>
+        internal async Task<List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>>
         GetPackageProductInfoAsync(
             List<uint> packageIds,
             bool forceUpdate = false,
             CancellationToken cancellationToken = default)
     {
         var productInfos = new List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>();
-        var packageRequests = new List<SteamKit.SteamApps.PICSRequest>();
+        var missing = new List<uint>();
 
         foreach (var packageId in packageIds)
         {
-            // Retrieve from cache if possible
+            // Retrieve from cache if possible, only ask Steam about the rest
             if (!forceUpdate && _packageProductInfos.TryGetValue(packageId, out var info))
             {
                 productInfos.Add(info);
             }
+            else
+            {
+                missing.Add(packageId);
+            }
         }
 
-        // Fetch live
-        var grantedIds = await RequestPackageAccessTokenIfNecessaryAsync(packageIds, cancellationToken);
-
-        foreach (var grantedPackageId in grantedIds)
+        if (missing.Count == 0)
         {
-            packageRequests.Add(
-                new SteamKit.SteamApps.PICSRequest
-                {
-                    ID = grantedPackageId,
-                    AccessToken = _packageAccessTokens[grantedPackageId]
-                });
+            return productInfos;
+        }
+
+        var grantedIds = await RequestPackageAccessTokenIfNecessaryAsync(missing, cancellationToken);
+
+        var packageRequests = grantedIds
+            .Select(id => new SteamKit.SteamApps.PICSRequest { ID = id, AccessToken = _packageAccessTokens[id] })
+            .ToList();
+
+        if (packageRequests.Count == 0)
+        {
+            return productInfos;
         }
 
         var result = await SteamApps.PICSGetProductInfo(new List<SteamKit.SteamApps.PICSRequest>(), packageRequests)
             .ToTask()
             .WaitAsync(cancellationToken);
 
-        foreach (var (key, value) in result.Results!.First().Packages)
+        foreach (var (key, value) in result.Results!.SelectMany(r => r.Packages))
         {
             _packageProductInfos.AddOrUpdate(key, value, (ek, ev) => value);
             productInfos.Add(value);
@@ -1068,22 +1064,17 @@ public class SteamContentClient : IAsyncDisposable
         uint id,
         CancellationToken cancellationToken = default)
     {
-        List<uint> packageIds = null;
+        // 17906 is the package id for downloading anonymous dedicated servers.
+        // One package id grants access to many app ids.
+        const uint dedicatedServerPackageId = 17906;
 
-        if (SteamUser.SteamID!.AccountType == SteamKit.EAccountType.AnonUser)
-        {
-            // 17906 is the package id for downloading anonymous dedicated servers.
-            // One package id grants access to many app ids.
-            packageIds = new List<uint> { 17906 };
-        }
-        else
-        {
-            packageIds = SteamClient.Licenses.Select(x => x.PackageID).ToList();
+        var packageIds = SteamUser.SteamID!.AccountType == SteamKit.EAccountType.AnonUser
+            ? new List<uint>()
+            : SteamClient.Licenses.Select(x => x.PackageID).ToList();
 
-            if (!packageIds.Contains(17906))
-            {
-                packageIds.Add(17906);
-            }
+        if (!packageIds.Contains(dedicatedServerPackageId))
+        {
+            packageIds.Add(dedicatedServerPackageId);
         }
 
         var packageInfos = await GetPackageProductInfoAsync(packageIds, false, cancellationToken);

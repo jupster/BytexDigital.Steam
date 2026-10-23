@@ -30,21 +30,27 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
             
             FileStream.Seek((long) offset, SeekOrigin.Begin);
-            await FileStream.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
+            await FileStream.WriteAsync(data.AsMemory()).ConfigureAwait(false);
         }
 
         public override async Task CancelAsync()
         {
+            // Nothing was written yet, so there is no stream to close
+            if (FileStream == null)
+            {
+                return;
+            }
+
             try
             {
                 await FileStream.FlushAsync().ConfigureAwait(false);
                 FileStream.Close();
             }
-            catch
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {
+                // Already closed, or the disk is gone. We are cancelling anyway.
             }
         }
-
         public override async ValueTask DisposeAsync()
         {
             await CancelAsync();

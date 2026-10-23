@@ -27,7 +27,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models
 
         public static implicit operator Manifest(SteamKit2.DepotManifest x)
         {
-            return new Manifest(x.Files.Select(x => (ManifestFile) x).ToList(), x.DepotID, x.ManifestGID,
+            return new Manifest(x.Files.Select(file => (ManifestFile) file).ToList(), x.DepotID, x.ManifestGID,
                 x.CreationTime, x.TotalUncompressedSize, x.TotalCompressedSize);
         }
     }
