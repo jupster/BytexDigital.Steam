@@ -26,21 +26,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public Func<ManifestFile, bool> FileCondition { get; protected set; }
         public DownloadHandlerStateEnum State { get; protected set; }
 
-        public double TotalProgress
-        {
-            get
-            {
-                var total = TotalFileSize;
-                if (total == 0)
-                    return 1;
-
-                // Weighted by size, so a tiny depot doesn't count as much as a huge one
-                return _multipleFilesHandlers.Sum(x => x.TotalProgress * x.TotalFileSize) / total;
-            }
-        }
-
+        public double TotalProgress => _multipleFilesHandlers.Sum(x => x.TotalProgress) / _multipleFilesHandlers.Count;
         public int TotalFileCount => _multipleFilesHandlers.Sum(x => x.TotalFileCount);
-        public ulong TotalFileSize => _multipleFilesHandlers.Aggregate(0UL, (sum, x) => sum + x.TotalFileSize);
+        public ulong TotalFileSize => _multipleFilesHandlers.Select(x => x.TotalFileSize).Aggregate((a, b) => a + b);
 
         public event EventHandler<FileVerifiedArgs> FileVerified;
         public event EventHandler<VerificationCompletedArgs> VerificationCompleted;
@@ -93,10 +81,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             
                 VerificationCompleted?.Invoke(this, new VerificationCompletedArgs(filesToDownload));
             }
-            catch (Exception)
+            catch
             {
                 State = DownloadHandlerStateEnum.Failed;
-                throw;
             }
         }
 
@@ -117,10 +104,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 DownloadComplete?.Invoke(this, EventArgs.Empty);
             }
-            catch (Exception)
+            catch
             {
                 State = DownloadHandlerStateEnum.Failed;
-                throw;
             }
         }
 
