@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -23,10 +24,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         internal AsyncAutoResetEvent _eventHandlerCompleted = new AsyncAutoResetEvent(true);
         internal int _eventHandlersRunning;
 
-        private ConcurrentDictionary<ManifestFile, FileTarget> _fileTargets =
-            new ConcurrentDictionary<ManifestFile, FileTarget>();
+        private readonly ConcurrentDictionary<ManifestFile, FileTarget> _fileTargets = new();
 
-        private ConcurrentBag<FileWriter> _fileWriters = new ConcurrentBag<FileWriter>();
+        private readonly ConcurrentBag<FileWriter> _fileWriters = new();
         private SteamCdnServerPool _serverPool;
         private ConcurrentBag<ChunkJob> _chunks = new ConcurrentBag<ChunkJob>();
         internal SteamContentClient _steamContentClient;
@@ -139,7 +139,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 // Filter out files that are directories or that the caller does not want
                 IEnumerable<ManifestFile> filteredFiles = Manifest.Files
-                    .Where(file => file.Flags != ManifestFileFlag.Directory && FileCondition.Invoke(file))
+                    .Where(file => !file.Flags.HasFlag(ManifestFileFlag.Directory) && FileCondition.Invoke(file))
                     .OrderBy(x => x.FileName)
                     .ToList();
 
@@ -147,25 +147,13 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 filteredFiles = filteredFiles.GroupBy(x => x.FileName).Select(x => x.First()).ToList();
 
                 if (!filteredFiles.Any())
-                {
-                    Logger?.LogTrace("No files to download");
-
-                    if (DownloadComplete != null)
-                    {
-                        // Wait for all file verified eventhandlers to finish so we don't send events out of order
-                        await WaitForEventHandlersAsync(cancellationToken);
-
-                        RunEventHandler(() => DownloadComplete!.Invoke(this, EventArgs.Empty));
-                    }
-
-                    return;
-                }
+                    Logger?.LogTrace("No files to verify");
 
                 // Verify all files in parallel
-                var verificationTaskFactories =
-                    filteredFiles.Select(
-                        file => new Func<Task>(
-                            async () => await Task.Run(() => VerifyFileAsync(file, DownloadDirectory, _chunks))));
+                var verificationTaskFactories = filteredFiles
+                    .Select(file => new Func<CancellationToken, Task>(
+                        ct => Task.Run(() => VerifyFileAsync(file, DownloadDirectory, _chunks), ct)))
+                    .ToList();
 
                 Logger?.LogTrace("Verifying files");
 
@@ -189,9 +177,11 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                             new VerificationCompletedArgs(_chunks.Select(x => x.ManifestFile).Distinct().ToList())));
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                State = DownloadHandlerStateEnum.SetUp;
+                State = DownloadHandlerStateEnum.Failed;
+                Logger?.LogError(ex, "Verification failed");
+                throw;
             }
         }
 
@@ -231,24 +221,17 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 var chunkList = sortedChunks.ToList();
                 Logger?.LogTrace($"Starting sequential download of {chunkList.Count} chunks");
 
-                var taskFactoriesQueue = sortedChunks.Select(
-                        chunkJob =>
-                            new Func<Task>(
-                                async () => await Task.Run(
-                                    () => DownloadChunkAsync(chunkJob, cancellationToken))))
+                var taskFactoriesQueue = sortedChunks
+                    .Select(chunkJob => new Func<CancellationToken, Task>(
+                        ct => DownloadChunkAsync(chunkJob, ct)))
                     .ToList();
 
-                Logger?.LogTrace($"Starting {taskFactoriesQueue.Count} download tasks");
+                Logger?.LogTrace("Starting {Count} download tasks", taskFactoriesQueue.Count);
 
-                if (taskFactoriesQueue.Count > 0)
-                {
-                    var tasksFactoryFailuresLookup = new ConcurrentDictionary<Func<Task>, int>();
-
-                    await ParallelAsync(
-                        _steamContentClient.MaxConcurrentDownloadsPerTask,
-                        taskFactoriesQueue,
-                        cancellationToken);
-                }
+                await ParallelAsync(
+                    _steamContentClient.MaxConcurrentDownloadsPerTask,
+                    taskFactoriesQueue,
+                    cancellationToken);
 
                 State = DownloadHandlerStateEnum.Downloaded;
                 Logger?.LogTrace("Completed download tasks");
@@ -261,25 +244,23 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     RunEventHandler(() => DownloadComplete!.Invoke(this, EventArgs.Empty));
                 }
             }
+            catch (Exception)
+            {
+                State = DownloadHandlerStateEnum.Failed;
+                throw;
+            }
             finally
             {
                 if (_fileWriters.Count > 0)
                 {
                     Logger?.LogTrace("Disposing all file writers");
 
-                    var disposeTasks = _fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask()));
-
-                    var cancellationTokenSource = new CancellationTokenSource();
-                    var cancellationTcs = new TaskCompletionSource<object>();
-                    cancellationTokenSource.Token.Register(() => cancellationTcs.TrySetCanceled(), false);
-
-                    await Task.WhenAny(Task.WhenAll(disposeTasks), cancellationTcs.Task);
+                    await Task.WhenAll(_fileWriters.Select(x => x.DisposeAsync().AsTask()))
+                        .ConfigureAwait(false);
                 }
 
                 Logger?.LogTrace("Closing server pool");
                 _serverPool?.Close();
-
-                State = DownloadHandlerStateEnum.Failed;
             }
 
             Logger?.LogTrace("Exiting");
@@ -295,63 +276,112 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
         }
 
-        private async Task ParallelAsync(
+        private static async Task ParallelAsync(
             int maxParallel,
-            IEnumerable<Func<Task>> taskFactories,
+            IReadOnlyList<Func<CancellationToken, Task>> taskFactories,
             CancellationToken cancellationToken)
         {
-            var taskFactoriesSource = taskFactories.ToArray();
-            var tasksRunning = new List<Task>(50);
+            if (taskFactories.Count == 0)
+                return;
+
+            maxParallel = Math.Max(1, maxParallel);
+
+            // Jobs get this token, so we can stop all of them if one fails
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var running = new List<Task>(maxParallel);
             var index = 0;
 
-            do
+            try
             {
-                while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
+                while (index < taskFactories.Count || running.Count > 0)
                 {
-                    var taskFactory = taskFactoriesSource[index++];
+                    while (running.Count < maxParallel && index < taskFactories.Count)
+                    {
+                        running.Add(taskFactories[index++](linked.Token));
+                    }
 
-                    tasksRunning.Add(taskFactory());
+                    var completed = await Task.WhenAny(running).ConfigureAwait(false);
+                    running.Remove(completed);
+
+                    // Throws here if that job failed
+                    await completed.ConfigureAwait(false);
                 }
+            }
+            catch
+            {
+                // A job failed or the user cancelled: tell the others to stop and wait for them
+                await linked.CancelAsync().ConfigureAwait(false);
 
-                var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
+                try
+                { await Task.WhenAll(running).ConfigureAwait(false); }
+                catch (Exception)
+                { /* the first error is the one that gets reported */ }
 
-                await completedTask.ConfigureAwait(false);
+                throw;
+            }
+        }
 
-                tasksRunning.Remove(completedTask);
-            } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
+        // The file name comes from the manifest, which a mod author controls. Make sure the final
+        // path stays inside the download folder, so a name like "..\..\x" can't write elsewhere.
+        private static string GetSafeTargetPath(string directory, string fileName)
+        {
+            var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)) + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(Path.Combine(root, fileName));
+
+            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"The manifest file name '{fileName}' points outside the download folder.");
+            }
+
+            return full;
+        }
+
+        [SuppressMessage("Security", "S4790", Justification = "Steam manifests store SHA-1 file hashes, so SHA-1 is required to compare them. It is not used for security here.")]
+        [SuppressMessage("Security", "CA5350", Justification = "Same reason: the Steam manifest format fixes the hash algorithm.")]
+        private static bool IsFileIdentical(string filePath, ManifestFile file)
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+            // Different length means different file, no need to hash it
+            if ((ulong) fs.Length != file.TotalSize)
+                return false;
+
+            return SHA1.HashData(fs).AsSpan().SequenceEqual(file.FileHash);
         }
 
         private Task VerifyFileAsync(ManifestFile file, string directory, ConcurrentBag<ChunkJob> chunks)
         {
-            var filePath = Path.Combine(directory, file.FileName);
-            var fileDirectory = Path.GetDirectoryName(filePath);
+            var filePath = GetSafeTargetPath(directory, file.FileName);
 
-            Directory.CreateDirectory(fileDirectory);
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
 
             if (File.Exists(filePath))
             {
-                using (var fs = new FileStream(filePath, FileMode.Open))
+                // If both files are identical, dont download the file
+                if (IsFileIdentical(filePath, file))
                 {
-                    // If the files are the same length, verify them using their hash
-                    if ((ulong) fs.Length == file.TotalSize)
+                    if (FileVerified != null)
                     {
-                        using var bs = new BufferedStream(fs);
-                        using var sha1 = new SHA1Managed();
-
-                        // If both files are identical, dont download the file
-                        if (sha1.ComputeHash(bs).SequenceEqual(file.FileHash))
-                        {
-                            if (FileVerified != null)
-                            {
-                                RunEventHandler(() => FileVerified.Invoke(this, new FileVerifiedArgs(file, false)));
-                            }
-
-                            return Task.CompletedTask;
-                        }
+                        RunEventHandler(() => FileVerified.Invoke(this, new FileVerifiedArgs(file, false)));
                     }
+
+                    return Task.CompletedTask;
                 }
 
                 File.Delete(filePath);
+            }
+
+            // An empty file has no chunks, so nothing would ever write it. Create it here.
+            if (file.TotalSize == 0)
+            {
+                File.WriteAllBytes(filePath, Array.Empty<byte>());
+
+                if (FileVerified != null)
+                {
+                    RunEventHandler(() => FileVerified.Invoke(this, new FileVerifiedArgs(file, false)));
+                }
+
+                return Task.CompletedTask;
             }
 
             var target = new FileStreamTarget(filePath, file.TotalSize);
@@ -392,82 +422,104 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             return Task.CompletedTask;
         }
 
-        private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
+        private const int MaxChunkAttempts = 5;
+
+        private async Task DownloadChunkAsync(
+            ChunkJob chunkJob,
+            CancellationToken cancellationToken)
         {
             var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
-            var downloadSuccess = false;
             var writtenBytes = 0;
-            Server server = default;
+            var downloaded = false;
+            Exception? lastException = null;
 
-            do
+            for (var attempt = 1; attempt <= MaxChunkAttempts && !downloaded; attempt++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                Server? server = null;
 
                 try
                 {
                     server = _serverPool.GetServer(cancellationToken);
 
                     writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
-                            DepotId,
-                            chunkJob.InternalChunk,
-                            server,
-                            downloadedData,
-                            _depotKey,
-                            _serverPool.DesignatedProxyServer)
+                        DepotId,
+                        chunkJob.InternalChunk,
+                        server,
+                        downloadedData,
+                        _depotKey,
+                        _serverPool.DesignatedProxyServer)
                         .ConfigureAwait(false);
 
-                    downloadSuccess = true;
+                    _serverPool.ReturnServer(server, false);
+                    server = null;
+
+                    downloaded = true;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    if (server != null)
+                        _serverPool.ReturnServer(server, false);
+
+                    throw;
                 }
                 catch (Exception ex)
                 {
-                    Logger?.LogError(ex, $"Failed to download chunk {chunkJob.InternalChunk.ChunkID} for file {chunkJob.ManifestFile.FileName}: {ex.Message}");
+                    lastException = ex;
+
+                    Logger?.LogWarning(
+                        ex,
+                        "Chunk download attempt {Attempt}/{Max} failed",
+                        attempt,
+                        MaxChunkAttempts);
+
+                    if (server != null)
                     _serverPool.ReturnServer(server, true);
-                    server = null;
-                }
-            } while (!downloadSuccess);
 
-            if (server != null) _serverPool.ReturnServer(server, false);
-
-            Logger?.LogTrace("Writing to FileWriter");
-            while (true)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
-                {
-                    await chunkJob.FileWriter.WriteAsync(chunkJob.InternalChunk.Offset, downloadedData[0..writtenBytes])
+                    if (attempt < MaxChunkAttempts)
+                    {
+                        await Task.Delay(
+                            TimeSpan.FromSeconds(attempt),
+                            cancellationToken)
                         .ConfigureAwait(false);
-                    
-                    break;
-                }
-                catch
-                {
-                    // ignore
+                    }
                 }
             }
+
+            if (!downloaded)
+            {
+                throw new SteamDownloadException(
+                    lastException ?? new InvalidOperationException(
+                        "Chunk download did not succeed."));
+            }
+
+            Logger?.LogTrace("Writing to FileWriter");
+
+            // Do not retry file writes. Disk, permission and locking errors
+            // should propagate to the caller.
+            await chunkJob.FileWriter.WriteAsync(
+                    chunkJob.InternalChunk.Offset,
+                    downloadedData[0..writtenBytes])
+                .ConfigureAwait(false);
 
             Logger?.LogTrace("Completed downloading chunk");
         }
 
+        private int _disposed;
+
         public async ValueTask DisposeAsync()
         {
-            // Dispose all file writers to release potential file streams
-            await Task.WhenAll(_fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask())));
-
-            _fileTargets = null;
-            _fileWriters = null;
-            _steamContentClient = null;
-
-            // Dispose the server pool
-            try
+            // Only the first call does the work, so disposing twice is harmless
+            if (Interlocked.Exchange(ref _disposed, 1) == 1)
             {
-                _serverPool?.Dispose();
-            }
-            catch
-            {
-                // ignored
+                return;
             }
 
+            // Release the file streams
+            await Task.WhenAll(_fileWriters.Select(x => x.DisposeAsync().AsTask())).ConfigureAwait(false);
+
+            _serverPool?.Dispose();
             _serverPool = null;
         }
 
@@ -486,6 +538,11 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     try
                     {
                         action.Invoke();
+                    }
+                    catch (Exception ex)
+                    {
+                        // A broken event handler must not take the download down, but it should not vanish either
+                        Logger?.LogError(ex, "An event handler threw an exception");
                     }
                     finally
                     {
