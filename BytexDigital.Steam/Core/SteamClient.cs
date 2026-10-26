@@ -189,6 +189,9 @@ namespace BytexDigital.Steam.Core
 
             var task = await Task.WhenAny(readyTask, faultedTask);
 
+            // WhenAny hands back a cancelled task instead of throwing, so check for it explicitly
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (task == faultedTask) throw new SteamClientFaultedException(FaultException);
 
             // If we are an anonymous user, the callback about owned licenses will not fire.
@@ -219,6 +222,9 @@ namespace BytexDigital.Steam.Core
 
             var task = await Task.WhenAny(readyTask, faultedTask);
 
+            // WhenAny hands back a cancelled task instead of throwing, so check for it explicitly
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (task == faultedTask) throw new SteamClientFaultedException(FaultException);
 
             if (!readyTask.IsCompletedSuccessfully) throw new SteamClientNotReadyException();
@@ -241,9 +247,7 @@ namespace BytexDigital.Steam.Core
 
                             if (string.IsNullOrEmpty(accessToken))
                             {
-                                var guardData = await _steamAuthenticator.GetGuardDataAsync(
-                                    _cancellationTokenSource
-                                        .Token);
+                                var guardData = await _steamAuthenticator.GetGuardDataAsync(_token);
 
                                 // Begin authenticating via credentials
                                 var authSession = await InternalClient.Authentication
@@ -409,6 +413,7 @@ namespace BytexDigital.Steam.Core
                 ActiveCellId = callback.CellID;
 
                 _logonAttemptsCounter = 0;
+                _cmAttemptsCounter    = 0;
 
                 _clientReadyEvent.Set();
                 return;
