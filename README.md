@@ -22,5 +22,7 @@ See the [test client project](https://github.com/BytexDigital/BytexDigital.Steam
 You can use a condition to limit your download to specific files.
 
 ```csharp
-var downloadTask = downloadHandler.DownloadToFolderAsync(@".\downloads", x => x.FileName.EndsWith(".exe"));
+await downloadHandler.SetupAsync(@".\downloads", file => file.FileName.EndsWith(".exe"));
+await downloadHandler.VerifyAsync();
+await downloadHandler.DownloadAsync();
 ```

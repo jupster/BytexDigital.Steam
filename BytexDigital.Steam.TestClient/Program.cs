@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using BytexDigital.Steam.ContentDelivery;
-using BytexDigital.Steam.ContentDelivery.Models.Downloading;
 using BytexDigital.Steam.Core;
 using SteamKit2;
 using SteamClient = BytexDigital.Steam.Core.SteamClient;
@@ -71,10 +70,7 @@ public static class Program
         
         try
         {
-            await using var downloadHandler = new MultiDepotDownloadHandler(
-                [handler]
-            );
-
+            await using var downloadHandler = handler;
             Console.WriteLine("Starting download");
 
             downloadHandler.FileVerified += (sender, args) =>
