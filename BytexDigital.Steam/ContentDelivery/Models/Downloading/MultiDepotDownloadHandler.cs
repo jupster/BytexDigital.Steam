@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Concurrent;
 using BytexDigital.Steam.ContentDelivery.Exceptions;
 
 namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
@@ -26,7 +27,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public Func<ManifestFile, bool> FileCondition { get; protected set; }
         public DownloadHandlerStateEnum State { get; protected set; }
 
-        public double TotalProgress => _multipleFilesHandlers.Sum(x => x.TotalProgress) / _multipleFilesHandlers.Count;
+        public double TotalProgress => _multipleFilesHandlers.Count == 0
+            ? 1
+            : _multipleFilesHandlers.Sum(x => x.TotalProgress) / _multipleFilesHandlers.Count;
         public int TotalFileCount => _multipleFilesHandlers.Sum(x => x.TotalFileCount);
         public ulong TotalFileSize => _multipleFilesHandlers.Select(x => x.TotalFileSize).Aggregate((a, b) => a + b);
 
@@ -62,7 +65,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             
             try
             {
-                var filesToDownload = new List<ManifestFile>();
+                var filesToDownload = new ConcurrentBag<ManifestFile>();
 
                 foreach (var handler in _multipleFilesHandlers)
                 {
@@ -79,7 +82,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 State = DownloadHandlerStateEnum.Verified;
             
-                VerificationCompleted?.Invoke(this, new VerificationCompletedArgs(filesToDownload));
+                VerificationCompleted?.Invoke(this, new VerificationCompletedArgs(filesToDownload.ToList()));
             }
             catch
             {
@@ -103,6 +106,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     await handler.DownloadAsync(cancellationToken);
                 }
 
+                State = DownloadHandlerStateEnum.Downloaded;
                 DownloadComplete?.Invoke(this, EventArgs.Empty);
             }
             catch

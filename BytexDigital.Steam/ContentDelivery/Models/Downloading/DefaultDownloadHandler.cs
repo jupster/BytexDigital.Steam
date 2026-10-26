@@ -181,15 +181,15 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 Logger?.LogTrace("Verification completed");
 
+                // Always wait, so every FileVerified handler has finished before anyone reads the results
+                await WaitForEventHandlersAsync(cancellationToken);
+
                 if (VerificationCompleted != null)
                 {
-                    // Wait for all file verified eventhandlers to finish so we don't send events out of order
-                    await WaitForEventHandlersAsync(cancellationToken);
-
                     RunEventHandler(
                         () => VerificationCompleted!.Invoke(
                             this,
-                            new VerificationCompletedArgs(_chunks.Select(x => x.ManifestFile).Distinct().ToList())));
+                            new VerificationCompletedArgs(_fileWriters.Select(x => x.ManifestFile).ToList())));
                 }
             }
             catch
@@ -209,18 +209,19 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             try
             {
                 State = DownloadHandlerStateEnum.Downloading;
+
+                // Zero-byte files have no chunks, so create them up front
+                foreach (var fileWriter in _fileWriters.Where(x => x.ExpectedBytes == 0))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    await fileWriter.WriteAsync(0, Array.Empty<byte>())
+                        .ConfigureAwait(false);
+                }
+
                 if (_chunks.IsEmpty)
                 {
                     Logger?.LogTrace("No chunks to download");
-
-                    // Complete any zero-byte files that have no chunks.
-                    foreach (var fileWriter in _fileWriters.Where(x => x.ExpectedBytes == 0))
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        await fileWriter.WriteAsync(0, Array.Empty<byte>())
-                            .ConfigureAwait(false);
-                    }
 
                     State = DownloadHandlerStateEnum.Downloaded;
 
