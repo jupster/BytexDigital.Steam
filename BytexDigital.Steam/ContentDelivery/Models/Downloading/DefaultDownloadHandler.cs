@@ -439,7 +439,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             return Task.CompletedTask;
         }
 
-        private async Task DownloadChunkAsync(ChunkJob chunkJob,CancellationToken cancellationToken)
+        private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
         {
         const int maxAttempts = 3;
 

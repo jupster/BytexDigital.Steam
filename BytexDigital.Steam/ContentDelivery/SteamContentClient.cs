@@ -1001,7 +1001,7 @@ public class SteamContentClient : IAsyncDisposable
         return productInfos;
     }
 
-        internal async Task<List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>>
+    internal async Task<List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>>
         GetPackageProductInfoAsync(
             List<uint> packageIds,
             bool forceUpdate = false,
