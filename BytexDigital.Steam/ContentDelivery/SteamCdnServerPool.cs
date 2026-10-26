@@ -29,9 +29,9 @@ namespace BytexDigital.Steam.ContentDelivery
         private readonly AsyncAutoResetEvent _populatePoolEvent = new(true);
         private readonly SteamContentClient _steamContentClient;
 
-        public ILogger Logger { get; set; }
+        public ILogger? Logger { get; set; }
         public Client CdnClient { get; }
-        public Server DesignatedProxyServer { get; private set; }
+        public Server? DesignatedProxyServer { get; private set; }
         public bool IsExhausted { get; private set; }
 
         public SteamCdnServerPool(

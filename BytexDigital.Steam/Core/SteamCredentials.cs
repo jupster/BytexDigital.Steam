@@ -9,11 +9,11 @@ namespace BytexDigital.Steam.Core
 
         public string Username { get; }
         public string Password { get; }
-        public string WebApiKey { get; }
+        public string? WebApiKey { get; }
 
         public bool IsAnonymous => Username == ANONYMOUS_USERNAME;
 
-        public SteamCredentials(string username, string password, string webApiKey = null)
+        public SteamCredentials(string username, string password, string? webApiKey = null)
         {
             if (username != ANONYMOUS_USERNAME)
             {

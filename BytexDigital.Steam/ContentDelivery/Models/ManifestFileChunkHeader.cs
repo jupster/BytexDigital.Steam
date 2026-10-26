@@ -1,4 +1,5 @@
-﻿namespace BytexDigital.Steam.ContentDelivery.Models
+﻿using System;
+namespace BytexDigital.Steam.ContentDelivery.Models
 {
     public class ManifestFileChunkHeader
     {
@@ -19,7 +20,11 @@
         }
 
         public static implicit operator ManifestFileChunkHeader(SteamKit2.DepotManifest.ChunkData chunk) =>
-            new ManifestFileChunkHeader(chunk.ChunkID, chunk.Checksum, chunk.Offset, chunk.CompressedLength,
+            new ManifestFileChunkHeader(
+                chunk.ChunkID ?? throw new ArgumentException("Chunk data must contain a chunk ID.", nameof(chunk)),
+                chunk.Checksum,
+                chunk.Offset,
+                chunk.CompressedLength,
                 chunk.UncompressedLength);
     }
 }

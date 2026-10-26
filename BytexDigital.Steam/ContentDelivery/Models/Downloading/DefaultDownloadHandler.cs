@@ -19,27 +19,36 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
     public class DefaultDownloadHandler : IDownloadHandler, IAsyncDisposable, IDisposable
     {
         //private CancellationTokenSource _cancellationTokenSource;
-        internal byte[] _depotKey;
+        internal byte[]? _depotKey;
         internal AsyncAutoResetEvent _eventHandlerCompleted = new AsyncAutoResetEvent(true);
         internal int _eventHandlersRunning;
 
-        private ConcurrentDictionary<ManifestFile, FileTarget> _fileTargets =
+        private ConcurrentDictionary<ManifestFile, FileTarget>? _fileTargets =
             new ConcurrentDictionary<ManifestFile, FileTarget>();
 
-        private ConcurrentBag<FileWriter> _fileWriters = new ConcurrentBag<FileWriter>();
-        private SteamCdnServerPool _serverPool;
+        private ConcurrentBag<FileWriter>? _fileWriters = new ConcurrentBag<FileWriter>();
+        private SteamCdnServerPool? _serverPool;
         private ConcurrentBag<ChunkJob> _chunks = new ConcurrentBag<ChunkJob>();
-        internal SteamContentClient _steamContentClient;
+        internal SteamContentClient? _steamContentClient;
+
+        private ConcurrentDictionary<ManifestFile, FileTarget> FileTargets =>
+            _fileTargets ?? throw new ObjectDisposedException(nameof(DefaultDownloadHandler));
+
+        private ConcurrentBag<FileWriter> FileWriters =>
+            _fileWriters ?? throw new ObjectDisposedException(nameof(DefaultDownloadHandler));
+
+        private SteamContentClient ContentClient =>
+            _steamContentClient ?? throw new ObjectDisposedException(nameof(DefaultDownloadHandler));
 
         public Manifest Manifest { get; }
         public AppId AppId { get; }
         public DepotId DepotId { get; }
         public ManifestId ManifestId { get; }
         public DownloadHandlerStateEnum State { get; protected set; }
-        public string DownloadDirectory { get; protected set; }
-        public Func<ManifestFile, bool> FileCondition { get; protected set; }
+	public string DownloadDirectory { get; protected set; } = null!;
+        public Func<ManifestFile, bool> FileCondition { get; protected set; } = null!;
 
-        public ILogger Logger { get; set; }
+        public ILogger? Logger { get; set; }
 
         public DefaultDownloadHandler(
             SteamContentClient steamContentClient,
@@ -55,10 +64,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             ManifestId = manifest.ManifestId;
         }
 
-        public event EventHandler<ManifestFile> FileDownloaded;
-        public event EventHandler<FileVerifiedArgs> FileVerified;
-        public event EventHandler<VerificationCompletedArgs> VerificationCompleted;
-        public event EventHandler<EventArgs> DownloadComplete;
+        public event EventHandler<ManifestFile>? FileDownloaded;
+        public event EventHandler<FileVerifiedArgs>? FileVerified;
+        public event EventHandler<VerificationCompletedArgs>? VerificationCompleted;
+        public event EventHandler<EventArgs>? DownloadComplete;
 
         public Task SetupAsync(
             string directory,
@@ -84,7 +93,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 if (State >= DownloadHandlerStateEnum.Verified)
                 {
-                    return _fileTargets.Count;
+                    return FileTargets.Count;
                 }
                 else
                 {
@@ -99,7 +108,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 if (State >= DownloadHandlerStateEnum.Verified)
                 {
-                    return _fileTargets.Select(x => x.Key.TotalSize).Aggregate(0UL, (a, b) => a + b);
+                    return FileTargets.Select(x => x.Key.TotalSize).Aggregate(0UL, (a, b) => a + b);
                 }
                 else
                 {
@@ -114,8 +123,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 if (State >= DownloadHandlerStateEnum.Verified)
                 {
-                    var totalBytes = _fileTargets.Sum(x => (long) x.Value.TotalBytes);
-                    var currentBytes = _fileTargets.Sum(x => (long) x.Value.WrittenBytes);
+                    var totalBytes = FileTargets.Sum(x => (long) x.Value.TotalBytes);
+                    var currentBytes = FileTargets.Sum(x => (long) x.Value.WrittenBytes);
 
                     return totalBytes > 0 ? (double) currentBytes / totalBytes : 1;
                 }
@@ -173,7 +182,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 Logger?.LogTrace("Verifying files");
 
                 await ParallelAsync(
-                    _steamContentClient.MaxConcurrentDownloadsPerTask,
+                    ContentClient.MaxConcurrentDownloadsPerTask,
                     verificationTaskFactories,
                     cancellationToken);
 
@@ -189,7 +198,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     RunEventHandler(
                         () => VerificationCompleted!.Invoke(
                             this,
-                            new VerificationCompletedArgs(_fileWriters.Select(x => x.ManifestFile).ToList())));
+                            new VerificationCompletedArgs(FileWriters.Select(x => x.ManifestFile).ToList())));
                 }
             }
             catch
@@ -211,7 +220,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 State = DownloadHandlerStateEnum.Downloading;
 
                 // Zero-byte files have no chunks, so create them up front
-                foreach (var fileWriter in _fileWriters.Where(x => x.ExpectedBytes == 0))
+                foreach (var fileWriter in FileWriters.Where(x => x.ExpectedBytes == 0))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
@@ -238,7 +247,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 Logger?.LogTrace("Creating Steam CDN server pool");
 
-                _serverPool = new SteamCdnServerPool(_steamContentClient, AppId, cancellationToken)
+                _serverPool = new SteamCdnServerPool(ContentClient, AppId, cancellationToken)
                 {
                     Logger = Logger
                 };
@@ -248,7 +257,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 Logger?.LogTrace("Fetching depot key");
 
                 // Get the depot key with which we will process all chunks downloaded
-                _depotKey = await _steamContentClient.GetDepotKeyAsync(DepotId, AppId);
+                _depotKey = await ContentClient.GetDepotKeyAsync(DepotId, AppId);
 
                 Logger?.LogTrace("Got depot key");
 
@@ -273,7 +282,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 if (taskFactoriesQueue.Count > 0)
                 {
                     await ParallelAsync(
-                        _steamContentClient.MaxConcurrentDownloadsPerTask,
+                        ContentClient.MaxConcurrentDownloadsPerTask,
                         taskFactoriesQueue,
                         cancellationToken);
                 }
@@ -298,12 +307,12 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 try
                 {
-                    if (_fileWriters.Count > 0)
+                    if (FileWriters.Count > 0)
                     {
                         Logger?.LogTrace("Disposing all file writers");
 
                         await Task.WhenAll(
-                            _fileWriters.Select(x => x.DisposeAsync().AsTask()));
+                            FileWriters.Select(x => x.DisposeAsync().AsTask()));
                     }
                 }
                 finally
@@ -372,7 +381,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             var filePath = DownloadPathHelper.GetSafePath(
                 directory,
                 file.FileName);
-            var fileDirectory = Path.GetDirectoryName(filePath);
+            var fileDirectory = Path.GetDirectoryName(filePath) ?? directory;
 
             Directory.CreateDirectory(fileDirectory);
 
@@ -403,14 +412,14 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             var target = new FileStreamTarget(filePath, file.TotalSize);
 
-            _fileTargets.TryAdd(file, target);
+            FileTargets.TryAdd(file, target);
 
             target.TotalBytes = file.TotalSize;
             target.WrittenBytes = 0;
 
             var fileWriter = new FileWriter(this, file, target, file.TotalSize);
 
-            _fileWriters.Add(fileWriter);
+            FileWriters.Add(fileWriter);
 
             foreach (var chunk in file.ChunkHeaders)
             {
@@ -442,6 +451,13 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
         {
         const int maxAttempts = 3;
+		    var serverPool = _serverPool
+                ?? throw new InvalidOperationException(
+                    "The CDN server pool has not been initialized or is no longer available.");
+
+        var depotKey = _depotKey
+            ?? throw new InvalidOperationException(
+                "The depot key has not been initialized. SetupAsync must complete before downloading chunks.");
 
         var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
         var writtenBytes = 0;
@@ -450,22 +466,22 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            Server server = null;
+            Server? server = null;
 
             try
             {
-                server = _serverPool.GetServer(cancellationToken);
+                server = serverPool.GetServer(cancellationToken);
 
                 writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
                     DepotId,
                     chunkJob.InternalChunk,
                     server,
                     downloadedData,
-                    _depotKey,
-                    _serverPool.DesignatedProxyServer)
+                    depotKey,
+                    serverPool.DesignatedProxyServer)
                     .ConfigureAwait(false);
 
-                _serverPool.ReturnServer(server, false);
+                serverPool.ReturnServer(server, false);
                 server = null;
 
                 break;
@@ -484,7 +500,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 if (server != null)
                 {
-                    _serverPool.ReturnServer(server, true);
+                    serverPool.ReturnServer(server, true);
                 }
 
                 Logger?.LogWarning(
@@ -537,11 +553,13 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public async ValueTask DisposeAsync()
         {
             // Already disposed
-            if (_fileWriters == null)
+            var fileWriters = _fileWriters;
+
+            if (fileWriters == null)
                 return;
 
             // Dispose all file writers to release potential file streams
-            await Task.WhenAll(_fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask())));
+            await Task.WhenAll(fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask())));
 
             _fileTargets = null;
             _fileWriters = null;
@@ -587,7 +605,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         internal class FileWriter : IAsyncDisposable
         {
             private readonly AsyncSemaphore _writeLock = new AsyncSemaphore(1);
-            private DefaultDownloadHandler _handler;
+            private DefaultDownloadHandler? _handler;
 
             public ulong WrittenBytes { get; private set; }
             public ulong ExpectedBytes { get; }
@@ -631,9 +649,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                     IsDone = true;
 
-                    if (_handler.FileDownloaded != null)
+                    var handler = _handler;
+                    if (handler?.FileDownloaded is { } fileDownloaded)
                     {
-                        _handler.RunEventHandler(() => _handler.FileDownloaded.Invoke(_handler, ManifestFile));
+                        handler.RunEventHandler(() => fileDownloaded.Invoke(handler, ManifestFile));
                     }
                 }
             }
@@ -657,10 +676,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         internal class ChunkJob
         {
-            public FileWriter FileWriter { get; set; }
-            public ManifestFile ManifestFile { get; set; }
-            public ManifestFileChunkHeader Chunk { get; set; }
-            public ChunkData InternalChunk { get; set; }
+            public required FileWriter FileWriter { get; set; }
+            public required ManifestFile ManifestFile { get; set; }
+            public required ManifestFileChunkHeader Chunk { get; set; }
+            public required ChunkData InternalChunk { get; set; }
         }
     }
 }

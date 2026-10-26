@@ -1,4 +1,5 @@
-﻿using System.IO;
+﻿using System;
+using System.IO;
 using System.Threading.Tasks;
 
 namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
@@ -7,7 +8,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
     {
         private readonly string _filePath;
         private readonly ulong _fileSize;
-        public FileStream FileStream { get; private set; }
+        public FileStream? FileStream { get; private set; }
 
         public FileStreamTarget(string filePath, ulong fileSize)
         {
@@ -17,34 +18,50 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         
         public override async Task CompleteAsync()
         {
-            await FileStream.FlushAsync().ConfigureAwait(false);
-            FileStream.Close();
+            var fileStream = FileStream
+                ?? throw new InvalidOperationException(
+                    "Cannot complete the file before its stream has been opened.");
+
+            await fileStream.FlushAsync().ConfigureAwait(false);
+            fileStream.Close();
         }
 
         public override async Task WriteAsync(ulong offset, byte[] data)
         {
-            if (FileStream == null)
+            var fileStream = FileStream;
+
+            if (fileStream == null)
             {
-                FileStream = new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
-                FileStream.SetLength((long) _fileSize);
+			    fileStream = new FileStream(
+                    _filePath,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.None,
+                    131072,
+                    true);
+
+                FileStream = fileStream;
+                fileStream.SetLength((long)_fileSize);
             }
-            
-            FileStream.Seek((long) offset, SeekOrigin.Begin);
-            await FileStream.WriteAsync(data.AsMemory()).ConfigureAwait(false);
-        }
+
+        fileStream.Seek((long)offset, SeekOrigin.Begin);
+        await fileStream.WriteAsync(data.AsMemory()).ConfigureAwait(false);
+    }
 
         public override async Task CancelAsync()
         {
-            // Nothing was written yet, so there is no stream to close
-            if (FileStream == null)
+            var fileStream = FileStream;
+
+            // Nothing was written yet, so there is no stream to close.
+            if (fileStream == null)
             {
                 return;
             }
 
             try
             {
-                await FileStream.FlushAsync().ConfigureAwait(false);
-                FileStream.Close();
+                await fileStream.FlushAsync().ConfigureAwait(false);
+                fileStream.Close();
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {

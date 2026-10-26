@@ -15,8 +15,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         public string FileUrl { get; }
         public string FileName { get; }
-        public string DownloadDirectory { get; protected set; }
-        public Func<ManifestFile, bool> FileCondition { get; protected set; }
+        public string DownloadDirectory { get; protected set; } = null!;
+        public Func<ManifestFile, bool> FileCondition { get; protected set; } = null!;
         public DownloadHandlerStateEnum State { get; protected set; }
 
         public LegacyDownloadHandler(string fileUrl, string fileName)
@@ -30,10 +30,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public int TotalFileCount => 1;
         public ulong TotalFileSize { get; private set; }
 
-        public event EventHandler<ManifestFile> FileDownloaded;
-        public event EventHandler<FileVerifiedArgs> FileVerified;
-        public event EventHandler<VerificationCompletedArgs> VerificationCompleted;
-        public event EventHandler<EventArgs> DownloadComplete;
+        public event EventHandler<ManifestFile>? FileDownloaded;
+        public event EventHandler<FileVerifiedArgs>? FileVerified;
+        public event EventHandler<VerificationCompletedArgs>? VerificationCompleted;
+        public event EventHandler<EventArgs>? DownloadComplete;
 
         public Task SetupAsync(string directory, Func<ManifestFile, bool> condition, CancellationToken cancellationToken = default)
         {
@@ -57,7 +57,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         public async Task DownloadAsync(CancellationToken cancellationToken = default)
         {
-            string path = null;
+            string? path = null;
 
             try
             {

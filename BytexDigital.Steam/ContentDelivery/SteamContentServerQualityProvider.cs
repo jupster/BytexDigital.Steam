@@ -31,7 +31,9 @@ namespace BytexDigital.Steam.ContentDelivery
         {
             try
             {
-                return JsonConvert.DeserializeObject<List<SteamContentServerQuality>>(File.ReadAllText(FileName));
+                return JsonConvert.DeserializeObject<List<SteamContentServerQuality>>(
+                    File.ReadAllText(FileName))
+                    ?? new List<SteamContentServerQuality>();
             }
             catch
             {

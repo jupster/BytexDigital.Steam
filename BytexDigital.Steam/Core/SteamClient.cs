@@ -80,8 +80,8 @@ namespace BytexDigital.Steam.Core
         public SteamClient(
             SteamCredentials credentials,
             SteamAuthenticator steamAuthenticator,
-            Action<SteamKit.ISteamConfigurationBuilder> steamConfigurationBuilder = default,
-            IRegionSpecificServerListProvider serverListProvider = default)
+            Action<SteamKit.ISteamConfigurationBuilder>? steamConfigurationBuilder = null,
+            IRegionSpecificServerListProvider? serverListProvider = null)
         {
             // Default values
             credentials ??= SteamCredentials.Anonymous;

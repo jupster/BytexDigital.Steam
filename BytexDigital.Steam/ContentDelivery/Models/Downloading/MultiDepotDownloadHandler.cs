@@ -23,8 +23,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
         }
         
-        public string DownloadDirectory { get; protected set; }
-        public Func<ManifestFile, bool> FileCondition { get; protected set; }
+        public string DownloadDirectory { get; protected set; } = null!;
+        public Func<ManifestFile, bool> FileCondition { get; protected set; } =null!;
         public DownloadHandlerStateEnum State { get; protected set; }
 
         public double TotalProgress => _multipleFilesHandlers.Count == 0
@@ -33,10 +33,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public int TotalFileCount => _multipleFilesHandlers.Sum(x => x.TotalFileCount);
         public ulong TotalFileSize => _multipleFilesHandlers.Select(x => x.TotalFileSize).Aggregate((a, b) => a + b);
 
-        public event EventHandler<FileVerifiedArgs> FileVerified;
-        public event EventHandler<VerificationCompletedArgs> VerificationCompleted;
-        public event EventHandler<ManifestFile> FileDownloaded;
-        public event EventHandler<EventArgs> DownloadComplete;
+        public event EventHandler<FileVerifiedArgs>? FileVerified;
+        public event EventHandler<VerificationCompletedArgs>? VerificationCompleted;
+        public event EventHandler<ManifestFile>? FileDownloaded;
+        public event EventHandler<EventArgs>? DownloadComplete;
         
         public async Task SetupAsync(string directory, Func<ManifestFile, bool> condition, CancellationToken cancellationToken = default)
         {

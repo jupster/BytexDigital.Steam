@@ -57,11 +57,25 @@ public class SteamContentClient : IAsyncDisposable
     public SteamContentClient(SteamClient steamClient, int maxConcurrentDownloadsPerTask = 10)
     {
         SteamClient = steamClient;
-        SteamUnifiedMessagesService = SteamClient.InternalClient.GetHandler<SteamKit.SteamUnifiedMessages>();
-        PublishedFileService = SteamUnifiedMessagesService.CreateService<PublishedFile>();
+        var steamUnifiedMessages = SteamClient.InternalClient
+        .GetHandler<SteamKit.SteamUnifiedMessages>()
+        ?? throw new InvalidOperationException(
+            "SteamKit did not provide the SteamUnifiedMessages handler.");
+
+        SteamUnifiedMessagesService = steamUnifiedMessages;
+        PublishedFileService = steamUnifiedMessages.CreateService<PublishedFile>();
+
         MaxConcurrentDownloadsPerTask = maxConcurrentDownloadsPerTask;
-        SteamApps = SteamClient.InternalClient.GetHandler<SteamKit.SteamApps>();
-        SteamUser = SteamClient.InternalClient.GetHandler<SteamKit.SteamUser>();
+
+        SteamApps = SteamClient.InternalClient
+            .GetHandler<SteamKit.SteamApps>()
+            ?? throw new InvalidOperationException(
+                "SteamKit did not provide the SteamApps handler.");
+
+        SteamUser = SteamClient.InternalClient
+            .GetHandler<SteamKit.SteamUser>()
+            ?? throw new InvalidOperationException(
+                "SteamKit did not provide the SteamUser handler.");
 
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(SteamClient.CancellationToken);
     }
@@ -344,9 +358,9 @@ public class SteamContentClient : IAsyncDisposable
     public async Task<IDownloadHandler> GetAppDataAsync(
         AppId appId,
         string branch = "public",
-        string branchPassword = default,
+        string? branchPassword = null,
         bool skipInaccessibleDepots = true,
-        Func<Depot, bool> depotIdCondition = default,
+        Func<Depot, bool>? depotIdCondition = null,
         CancellationToken cancellationToken = default)
     {
         // Get all depots that are part of the branch
@@ -424,7 +438,7 @@ public class SteamContentClient : IAsyncDisposable
         AppId appId,
         DepotId depotId,
         string branch = "public",
-        string branchPassword = default,
+        string? branchPassword = null,
         bool skipInaccessibleDepots = true,
         CancellationToken cancellationToken = default)
     {
@@ -461,7 +475,7 @@ public class SteamContentClient : IAsyncDisposable
 
     public async Task<IReadOnlyList<Depot>> GetDepotsAsync(
         AppId appId,
-        string branch = default,
+        string? branch = null,
         bool resolveSharedDepots = true,
         CancellationToken cancellationToken = default)
     {
@@ -777,7 +791,7 @@ public class SteamContentClient : IAsyncDisposable
         AppId appId,
         DepotId depotId,
         string branch = "public",
-        string branchPassword = default,
+        string? branchPassword = null,
         CancellationToken cancellationToken = default)
     {
         // Enforce a default branch.
