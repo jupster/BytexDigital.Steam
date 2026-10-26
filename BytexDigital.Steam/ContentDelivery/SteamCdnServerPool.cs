@@ -188,6 +188,8 @@ namespace BytexDigital.Steam.ContentDelivery
 
         private async Task<IReadOnlyCollection<Server>> GetServerListAsync()
         {
+            const int maxListAttempts = 10;
+            var failures      = 0;
             var throttleDelay = 0;
 
             while (true)
@@ -218,6 +220,12 @@ namespace BytexDigital.Steam.ContentDelivery
                 catch (Exception ex)
                 {
                     Logger?.LogWarning(ex, "Could not load the CDN server list, trying again");
+
+                    if (++failures >= maxListAttempts)
+                    {
+                        // Give up. An empty list marks the pool as exhausted, so callers get an error instead of waiting forever.
+                        return Array.Empty<Server>();
+                    }
 
                     if (ex is SteamKitWebRequestException { StatusCode: HttpStatusCode.TooManyRequests })
                     {
