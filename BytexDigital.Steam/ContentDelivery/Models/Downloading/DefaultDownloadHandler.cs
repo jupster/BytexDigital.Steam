@@ -261,7 +261,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 var chunkList = sortedChunks.ToList();
                 Logger?.LogTrace($"Starting sequential download of {chunkList.Count} chunks");
 
-                var taskFactoriesQueue = sortedChunks.Select(
+                var taskFactoriesQueue = chunkList.Select(
                         chunkJob =>
                             new Func<Task>(
                                 async () => await Task.Run(
@@ -310,7 +310,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 {
                     Logger?.LogTrace("Closing server pool");
 
-                    _serverPool?.Close();
+                    _serverPool?.Dispose();
                     _serverPool = null;
                 }
             }
@@ -350,6 +350,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             do
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
                 {
                     var taskFactory = taskFactoriesSource[index++];
@@ -376,7 +378,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             if (File.Exists(filePath))
             {
-                using (var fs = new FileStream(filePath, FileMode.Open))
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
                     // If the files are the same length, verify them using their hash
                     if ((ulong) fs.Length == file.TotalSize)
@@ -534,6 +536,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         public async ValueTask DisposeAsync()
         {
+            // Already disposed
+            if (_fileWriters == null)
+                return;
+
             // Dispose all file writers to release potential file streams
             await Task.WhenAll(_fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask())));
 
