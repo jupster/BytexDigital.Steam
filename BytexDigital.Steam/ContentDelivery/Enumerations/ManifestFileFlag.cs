@@ -1,5 +1,6 @@
 ﻿namespace BytexDigital.Steam.ContentDelivery.Enumerations
 {
+    [Flags]
     public enum ManifestFileFlag
     {
         UserConfig = 1,

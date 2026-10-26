@@ -139,7 +139,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 // Filter out files that are directories or that the caller does not want
                 IEnumerable<ManifestFile> filteredFiles = Manifest.Files
-                    .Where(file => file.Flags != ManifestFileFlag.Directory && FileCondition.Invoke(file))
+                    .Where(file => !file.Flags.HasFlag(ManifestFileFlag.Directory) && FileCondition.Invoke(file))
                     .OrderBy(x => x.FileName)
                     .ToList();
 
@@ -272,8 +272,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 if (taskFactoriesQueue.Count > 0)
                 {
-                    var tasksFactoryFailuresLookup = new ConcurrentDictionary<Func<Task>, int>();
-
                     await ParallelAsync(
                         _steamContentClient.MaxConcurrentDownloadsPerTask,
                         taskFactoriesQueue,
@@ -384,10 +382,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     if ((ulong) fs.Length == file.TotalSize)
                     {
                         using var bs = new BufferedStream(fs);
-                        using var sha1 = new SHA1Managed();
 
                         // If both files are identical, dont download the file
-                        if (sha1.ComputeHash(bs).SequenceEqual(file.FileHash))
+                        if (SHA1.HashData(bs).SequenceEqual(file.FileHash))
                         {
                             if (FileVerified != null)
                             {
