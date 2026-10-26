@@ -211,8 +211,18 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 State = DownloadHandlerStateEnum.Downloading;
                 if (_chunks.IsEmpty)
                 {
-                    State = DownloadHandlerStateEnum.Downloaded;
                     Logger?.LogTrace("No chunks to download");
+
+                    // Complete any zero-byte files that have no chunks.
+                    foreach (var fileWriter in _fileWriters.Where(x => x.ExpectedBytes == 0))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        await fileWriter.WriteAsync(0, Array.Empty<byte>())
+                            .ConfigureAwait(false);
+                    }
+
+                    State = DownloadHandlerStateEnum.Downloaded;
 
                     if (DownloadComplete != null)
                     {
