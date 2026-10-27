@@ -316,7 +316,7 @@ namespace BytexDigital.Steam.Core
                             {
                                 Username = Credentials.Username,
                                 AccessToken = accessToken,
-                                LoginID = (uint) Random.Shared.Next(100000000, 999999999)
+                                LoginID = (uint)System.Security.Cryptography.RandomNumberGenerator.GetInt32(100_000_000, 999_999_999)
                             });
                     });
             }
