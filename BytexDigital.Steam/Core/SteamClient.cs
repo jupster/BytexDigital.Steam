@@ -50,7 +50,7 @@ namespace BytexDigital.Steam.Core
         ///     Server that the client will be forced to connect to.
         ///     <para>If unavailable, the client will attempt reconnecting until a shutdown is forced.</para>
         /// </summary>
-        public ServerRecord ForcedServer { get; set; }
+        public ServerRecord? ForcedServer { get; set; }
 
         public CancellationToken CancellationToken => _token;
 
@@ -72,10 +72,14 @@ namespace BytexDigital.Steam.Core
         public int MaximumLogonAttempts { get; set; } = 1;
         public int MaximumCmServerAttempts { get; set; } = 15;
         public uint ActiveCellId { get; private set; }
-        public Exception FaultException { get; private set; }
+        public Exception? FaultException { get; private set; }
 
         internal SteamKit.CallbackManager CallbackManager { get; set; }
-        internal IList<SteamKit.SteamApps.LicenseListCallback.License> Licenses { get; set; }
+        internal IList<SteamKit.SteamApps.LicenseListCallback.License> Licenses
+        { 
+            get; 
+            set; 
+        } = new List<SteamKit.SteamApps.LicenseListCallback.License>();
 
         public SteamClient(
             SteamCredentials credentials,
@@ -119,9 +123,17 @@ namespace BytexDigital.Steam.Core
             _token = _cancellationTokenSource.Token;
             CallbackManager = new SteamKit.CallbackManager(InternalClient);
 
-            _steamUserHandler = InternalClient.GetHandler<SteamKit.SteamUser>();
-            _steamAppsHandler = InternalClient.GetHandler<SteamKit.SteamApps>();
-            _steamContentHandler = InternalClient.GetHandler<SteamKit.SteamContent>();
+            _steamUserHandler = InternalClient.GetHandler<SteamKit.SteamUser>()
+                ?? throw new InvalidOperationException(
+                    "SteamKit failed to provide the SteamUser handler.");
+
+            _steamAppsHandler = InternalClient.GetHandler<SteamKit.SteamApps>()
+                ?? throw new InvalidOperationException(
+                    "SteamKit failed to provide the SteamApps handler.");
+
+            _steamContentHandler = InternalClient.GetHandler<SteamKit.SteamContent>()
+                ?? throw new InvalidOperationException(
+                    "SteamKit failed to provide the SteamContent handler.");
 
             CallbackManager.Subscribe<SteamKit.SteamClient.ConnectedCallback>(OnConnected);
             CallbackManager.Subscribe<SteamKit.SteamClient.DisconnectedCallback>(OnDisconnected);
@@ -154,13 +166,13 @@ namespace BytexDigital.Steam.Core
         /// <summary>
         ///     Event handler that fires upon exception that are produced by user code.
         /// </summary>
-        public event EventHandler<Exception> OnUnhandledException;
+        public event EventHandler<Exception>? OnUnhandledException;
 
-        public event Action InternalClientAttemptingConnect;
-        public event Action InternalClientConnected;
-        public event Action InternalClientDisconnected;
-        public event Action InternalClientLoggedOn;
-        public event Action InternalClientLoggedOff;
+        public event Action? InternalClientAttemptingConnect;
+        public event Action? InternalClientConnected;
+        public event Action? InternalClientDisconnected;
+        public event Action? InternalClientLoggedOn;
+        public event Action? InternalClientLoggedOff;
 
         public void Shutdown()
         {

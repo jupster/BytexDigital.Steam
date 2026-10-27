@@ -31,8 +31,18 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public ulong TotalFileSize { get; private set; }
 
         public event EventHandler<ManifestFile>? FileDownloaded;
-        public event EventHandler<FileVerifiedArgs>? FileVerified;
-        public event EventHandler<VerificationCompletedArgs>? VerificationCompleted;
+        // Legacy HTTP downloads don't perform manifest-based verification.
+        public event EventHandler<FileVerifiedArgs>? FileVerified
+        {
+            add { }
+            remove { }
+        }
+
+        public event EventHandler<VerificationCompletedArgs>? VerificationCompleted
+        {
+            add { }
+            remove { }
+        }
         public event EventHandler<EventArgs>? DownloadComplete;
 
         public Task SetupAsync(string directory, Func<ManifestFile, bool> condition, CancellationToken cancellationToken = default)

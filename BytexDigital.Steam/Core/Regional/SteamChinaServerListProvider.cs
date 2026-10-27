@@ -10,23 +10,25 @@ namespace BytexDigital.Steam.Core.Regional
 {
     public class SteamChinaServerListProvider : IRegionSpecificServerListProvider
     {
-        public SteamConfiguration SteamConfiguration { get; private set; }
+        public SteamConfiguration? SteamConfiguration { get; private set; }
 
         private DateTime _lastServerListRefresh = DateTime.MinValue;
         public DateTime LastServerListRefresh => _lastServerListRefresh;
 
         public async Task<IEnumerable<ServerRecord>> FetchServerListAsync()
         {
-            if (SteamConfiguration == null)
+            var configuration = SteamConfiguration;
+
+            if (configuration is null)
             {
                 throw new InvalidOperationException(
                     "Cannot fetch server list without first providing a SteamConfiguration object.");
             }
 
-            var directory = SteamConfiguration.GetAsyncWebAPIInterface("ISteamDirectory");
+            var directory = configuration.GetAsyncWebAPIInterface("ISteamDirectory");
             var args = new Dictionary<string, object?>
             {
-                ["cellid"] = SteamConfiguration.CellID.ToString(CultureInfo.InvariantCulture),
+                ["cellid"] = configuration.CellID.ToString(CultureInfo.InvariantCulture),
                 ["launcher"] = "7",
                 ["steamrealm"] = "steamchina"
             };
@@ -76,6 +78,7 @@ namespace BytexDigital.Steam.Core.Regional
 
         public void SetSteamConfiguration(SteamConfiguration steamConfiguration)
         {
+            ArgumentNullException.ThrowIfNull(steamConfiguration);
             SteamConfiguration = steamConfiguration;
         }
     }

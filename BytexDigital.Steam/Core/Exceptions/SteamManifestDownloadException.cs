@@ -9,7 +9,7 @@ namespace BytexDigital.Steam.ContentDelivery.Exceptions
         {
         }
 
-        public SteamManifestDownloadException(string message, Exception innerException) : base(message, innerException)
+        public SteamManifestDownloadException(string message, Exception? innerException) : base(message, innerException)
         {
         }
 

@@ -27,8 +27,19 @@ namespace BytexDigital.Steam.ContentDelivery.Models
 
         public static implicit operator Manifest(SteamKit2.DepotManifest x)
         {
-            return new Manifest(x.Files.Select(file => (ManifestFile) file).ToList(), x.DepotID, x.ManifestGID,
-                x.CreationTime, x.TotalUncompressedSize, x.TotalCompressedSize);
+            ArgumentNullException.ThrowIfNull(x);
+
+            var files = x.Files
+                ?? throw new InvalidOperationException(
+                    "The SteamKit depot manifest does not contain a file collection.");
+
+            return new Manifest(
+                files.Select(file => (ManifestFile)file).ToList(),
+                x.DepotID,
+                x.ManifestGID,
+                x.CreationTime,
+                x.TotalUncompressedSize,
+                x.TotalCompressedSize);
         }
     }
 }

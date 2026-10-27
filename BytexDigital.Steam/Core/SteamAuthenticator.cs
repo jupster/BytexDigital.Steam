@@ -103,7 +103,7 @@ namespace BytexDigital.Steam.Core
             {
                 Console.Write("Please enter your 2FA code:");
 
-                code = Console.ReadLine();
+                code = Console.ReadLine() ?? string.Empty;
             } while (string.IsNullOrEmpty(code));
 
             return Task.FromResult(code);
@@ -125,7 +125,7 @@ namespace BytexDigital.Steam.Core
             {
                 Console.Write($"Please enter your 2FA code that was sent to your email ({accountEmail}): ");
 
-                code = Console.ReadLine();
+                code = Console.ReadLine() ?? string.Empty;
             } while (string.IsNullOrEmpty(code));
 
             return Task.FromResult(code);
@@ -140,7 +140,7 @@ namespace BytexDigital.Steam.Core
 
             do
             {
-                response = Console.ReadLine()?.ToLower();
+                response = Console.ReadLine()?.ToLowerInvariant() ?? string.Empty;
             } while (response != "y" && response != "n");
 
             return Task.FromResult(response == "y");

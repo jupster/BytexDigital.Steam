@@ -65,7 +65,7 @@ namespace BytexDigital.Steam.ContentDelivery
         {
             // Stops waiting when the caller cancels OR when the pool is closed or gives up
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _token);
-            Server server;
+            Server? server;
 
             do
             {

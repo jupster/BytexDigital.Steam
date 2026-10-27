@@ -113,13 +113,13 @@ public class SteamContentClient : IAsyncDisposable
         var attempts = 0;
         const int maxAttempts = 5;
 
-        Exception lastException = default;
+        Exception? lastException = null;
 
         while (attempts < maxAttempts && !cancellationToken.IsCancellationRequested)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            Server server = default;
+            Server? server = null;
             var healthy = false;
 
             try
@@ -538,7 +538,9 @@ public class SteamContentClient : IAsyncDisposable
             var depotId = uint.Parse(depot.Name!);
 
             // Collect data
-            var name = depot["name"].Value;
+            var name = depot["name"].Value
+                ?? throw new InvalidOperationException(
+                    "A depot is missing its name.");
             var maxSize = depot["maxsize"].AsUnsignedLong();
             var isSharedInstall = depot["sharedinstall"].AsBoolean();
             var depotFromApp = (AppId?) depot["depotfromapp"].AsUnsignedInteger();
@@ -548,71 +550,110 @@ public class SteamContentClient : IAsyncDisposable
             var languages = new List<string>();
             var configEntries = new Dictionary<string, string>();
 
-            foreach (var configEntry in depot["config"].Children)
+        foreach (var configEntry in depot["config"].Children)
+        {
+            var entryName = configEntry.Name;
+
+            if (string.IsNullOrEmpty(entryName))
             {
-                if (configEntry.Name == "oslist")
+                continue;
+            }
+
+            if (entryName == "oslist")
+            {
+                var value = configEntry.AsString();
+
+                if (!string.IsNullOrEmpty(value))
                 {
                     operatingSystems.AddRange(
-                        configEntry
-                            .AsString()
-                            .Split(',')
+                        value.Split(',', StringSplitOptions.RemoveEmptyEntries)
                             .Select(identifier => new SteamOs(identifier)));
                 }
-                else if (configEntry.Name == "osarch")
+            }
+            else if (entryName == "osarch")
+            {
+                var value = configEntry.AsString();
+
+                if (!string.IsNullOrEmpty(value))
                 {
                     processorArchitectures.AddRange(
-                        configEntry
-                            .AsString()
-                            .Split(','));
-                }
-                else if (configEntry.Name == "language")
-                {
-                    languages.AddRange(
-                        configEntry
-                            .AsString()
-                            .Split(','));
-                }
-                else
-                {
-                    configEntries[configEntry.Name] = configEntry.Value;
+                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
                 }
             }
+            else if (entryName == "language")
+            {
+                var value = configEntry.AsString();
+
+                if (!string.IsNullOrEmpty(value))
+                {
+                    languages.AddRange(
+                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
+                }
+            }
+            else
+            {
+                var value = configEntry.Value;
+
+                if (value is not null)
+                {
+                    configEntries[entryName] = value;
+                }
+            }
+        }
 
             var manifests = depot["manifests"]
                 .Children
-                .Select(x => new DepotManifest(x.Name, x["gid"].AsUnsignedLong()))
+                .Select(x => new DepotManifest(
+                    x.Name ?? throw new InvalidOperationException(
+                        "A depot manifest entry is missing its branch name."),
+                    x["gid"].AsUnsignedLong()))
                 .ToList();
 
             var encryptedManifests = depot["encryptedmanifests"]
                 .Children
-                .Select(
-                    manifest =>
+                .Select(manifest =>
                     {
+                        var branchName = manifest.Name
+                            ?? throw new InvalidOperationException(
+                                "An encrypted depot manifest is missing its branch name.");
+
                         if (manifest["encrypted_gid_2"] != SteamKit.KeyValue.Invalid)
                         {
+                            var encryptedGid = manifest["encrypted_gid_2"].Value
+                                ?? throw new InvalidOperationException(
+                                    "An encrypted depot manifest is missing its V2 ID.");
+
                             return new DepotEncryptedManifest(
                                 appId,
                                 depotId,
-                                manifest.Name,
-                                manifest["encrypted_gid_2"].Value,
+                                branchName,
+                                encryptedGid,
                                 DepotEncryptedManifest.EncryptionVersion.V2);
                         }
 
                         if (manifest["encrypted_gid"] != SteamKit.KeyValue.Invalid)
                         {
+                            var encryptedGid = manifest["encrypted_gid"].Value
+                                ?? throw new InvalidOperationException(
+                                    "An encrypted depot manifest is missing its V1 ID.");
+
                             return new DepotEncryptedManifest(
                                 appId,
                                 depotId,
-                                manifest.Name,
-                                manifest["encrypted_gid"].Value,
+                                branchName,
+                                encryptedGid,
                                 DepotEncryptedManifest.EncryptionVersion.V1);
                         }
+
+                        var gid = manifest["gid"].Value
+                            ?? throw new InvalidOperationException(
+                                "An encrypted depot manifest is missing its fallback ID.");
 
                         return new DepotEncryptedManifest(
                             appId,
                             depotId,
-                            manifest.Name,
-                            manifest["gid"].Value,
+                            branchName,
+                            gid,
                             DepotEncryptedManifest.EncryptionVersion.V2);
                     })
                 .ToList();
@@ -712,9 +753,15 @@ public class SteamContentClient : IAsyncDisposable
 
         foreach (var branch in branches.Children)
         {
-            var name = branch.Name;
+            var name = branch.Name
+                ?? throw new InvalidOperationException(
+                    "A branch is missing its name.");
+
             var buildid = branch["buildid"].AsUnsignedLong();
-            var description = branch["description"].AsString();
+
+            var description = branch["description"].AsString()
+                ?? string.Empty;
+
             var requiresPassword = branch["pwdrequired"].AsBoolean();
             var timeUpdated = branch["timeupdated"].AsLong();
 
@@ -1125,10 +1172,7 @@ public class SteamContentClient : IAsyncDisposable
 
     private static byte[] DecodeHexString(string hex)
     {
-        if (hex == null)
-        {
-            return null;
-        }
+        ArgumentNullException.ThrowIfNull(hex);
 
         var chars = hex.Length;
         var bytes = new byte[chars / 2];
