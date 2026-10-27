@@ -450,7 +450,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
         {
-        const int maxAttempts = 3;
+        const int maxAttempts = 5;
 		    var serverPool = _serverPool
                 ?? throw new InvalidOperationException(
                     "The CDN server pool has not been initialized or is no longer available.");
@@ -472,7 +472,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 server = serverPool.GetServer(cancellationToken);
 
-                writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
+                writtenBytes = await serverPool.CdnClient.DownloadDepotChunkAsync(
                     DepotId,
                     chunkJob.InternalChunk,
                     server,
@@ -491,7 +491,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 if (server != null)
                 {
-                    _serverPool.ReturnServer(server, false);
+                    serverPool.ReturnServer(server, false);
                 }
 
                 throw;
@@ -517,7 +517,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 }
 
                 await Task.Delay(
-                    TimeSpan.FromMilliseconds(250 * attempt),
+                    TimeSpan.FromSeconds(attempt),
                     cancellationToken).ConfigureAwait(false);
             }
         }
