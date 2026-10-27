@@ -31,7 +31,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             ? 1
             : _multipleFilesHandlers.Sum(x => x.TotalProgress) / _multipleFilesHandlers.Count;
         public int TotalFileCount => _multipleFilesHandlers.Sum(x => x.TotalFileCount);
-        public ulong TotalFileSize => _multipleFilesHandlers.Select(x => x.TotalFileSize).Aggregate((a, b) => a + b);
+        public ulong TotalFileSize => _multipleFilesHandlers.Aggregate(
+            0UL,
+            (total, handler) => total + handler.TotalFileSize);
 
         public event EventHandler<FileVerifiedArgs>? FileVerified;
         public event EventHandler<VerificationCompletedArgs>? VerificationCompleted;
@@ -91,18 +93,24 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
         }
 
-        public async Task DownloadAsync(CancellationToken cancellationToken = default)
+        public async Task DownloadAsync(
+            CancellationToken cancellationToken = default)
         {
             if (State != DownloadHandlerStateEnum.Verified)
             {
-                throw new DownloadHandlerStateMismatchException(DownloadHandlerStateEnum.Verified, State);
+                throw new DownloadHandlerStateMismatchException(
+                    DownloadHandlerStateEnum.Verified,
+                    State);
             }
-            
+
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                State = DownloadHandlerStateEnum.Downloading;
+
                 foreach (var handler in _multipleFilesHandlers)
                 {
-                    // Start download
                     await handler.DownloadAsync(cancellationToken);
                 }
 
