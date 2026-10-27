@@ -395,7 +395,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                         using var bs = new BufferedStream(fs);
 
                         // If both files are identical, dont download the file
-                        if (SHA1.HashData(bs).SequenceEqual(file.FileHash))
+                        // Steam depot manifests specify file hashes as SHA-1.
+                        // This comparison preserves compatibility with the manifest format;
+                        // SHA-1 is not being used for password storage or authentication.
+                        if (SHA1.HashData(bs).SequenceEqual(file.FileHash)) // NOSONAR
                         {
                             if (FileVerified != null)
                             {
