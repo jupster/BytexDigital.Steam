@@ -1,0 +1,33 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore BytexDigital.Steam.sln
+
+      - name: Build solution
+        run: dotnet build BytexDigital.Steam.sln --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test BytexDigital.Steam.Tests/BytexDigital.Steam.Tests.csproj --configuration Release --no-build --no-restore --logger "console;verbosity=normal"
