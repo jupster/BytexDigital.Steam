@@ -1,75 +1,106 @@
+using System;
 using System.Collections.Concurrent;
-using BytexDigital.Steam.Core.Structs;
-using Nito.AsyncEx;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace BytexDigital.Steam.ContentDelivery
+namespace BytexDigital.Steam.ContentDelivery;
+
+internal sealed class CdnAuthTokenCache
 {
-    internal readonly record struct CachedCdnToken(string Value, DateTime Expiration);
+    private static readonly TimeSpan ExpirySafetyWindow =
+        TimeSpan.FromMinutes(1);
 
     /// <summary>
     ///     Holds CDN auth tokens, one per depot and host, and decides when a 403 is worth retrying.
     /// </summary>
-    internal sealed class CdnAuthTokenCache
-    {
         // A token this close to expiring is treated as already expired
-        private static readonly TimeSpan ExpiryMargin = TimeSpan.FromMinutes(1);
+    private readonly ConcurrentDictionary<string, Entry> _tokens = new();
+    private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
-        private readonly ConcurrentDictionary<string, CachedCdnToken> _tokens = new();
-        private readonly AsyncLock _lock = new();
-        private readonly Func<DateTime> _utcNow;
+    internal string? GetToken(string key)
+    {
+        return _tokens.TryGetValue(key, out var entry) && IsUsable(entry)
+            ? entry.Token
+            : null;
+    }
 
-        public CdnAuthTokenCache(Func<DateTime>? utcNow = null)
-        {
-            _utcNow = utcNow ?? (() => DateTime.UtcNow);
-        }
+    internal async Task<bool> RefreshAsync(
+        string key,
+        string? rejectedToken,
+        Func<CancellationToken, Task<Entry?>> requestToken,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(requestToken);
 
-        private static string Key(DepotId depotId, string host) => $"{depotId.Id}:{host}";
+        await _refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         // The cached token for this depot on this host, or null if the server never asked for one
-        public string? Get(DepotId depotId, string host)
+        try
         {
-            return _tokens.TryGetValue(Key(depotId, host), out var token) ? token.Value : null;
-        }
+            if (_tokens.TryGetValue(key, out var existing))
+            {
+                // Another worker has already replaced the rejected token.
+                if (IsUsable(existing) &&
+                    !string.Equals(
+                        existing.Token,
+                        rejectedToken,
+                        StringComparison.Ordinal))
+                {
+                    return true;
+                }
 
         /// <summary>
         ///     Called after a CDN server answered 403. Returns true if retrying on this server is worthwhile,
         ///     false if the server should be dropped.
         /// </summary>
-        public async Task<bool> RefreshAsync(
-            DepotId depotId,
-            string host,
-            string? rejectedToken,
-            Func<CancellationToken, Task<CachedCdnToken?>> fetch,
-            CancellationToken cancellationToken)
-        {
-            var key = Key(depotId, host);
+                _tokens.TryRemove(key, out _);
+            }
 
             // One request at a time, so many workers failing together only ask Steam once
-            using var lk = await _lock.LockAsync(cancellationToken);
-
-            if (_tokens.TryGetValue(key, out var existing) && existing.Expiration > _utcNow() + ExpiryMargin)
-            {
-                // A valid token that is not the rejected one means another worker already refreshed it.
-                // The rejected token itself still being valid means the token is not the problem: this server refuses us.
-                return existing.Value != rejectedToken;
-            }
+            Entry? replacement;
 
             try
             {
-                var fetched = await fetch(cancellationToken);
-
-                if (fetched is null)
-                {
-                    return false;
-                }
-
-                _tokens[key] = fetched.Value;
-                return true;
+                // A valid token that is not the rejected one means another worker already refreshed it.
+                // The rejected token itself still being valid means the token is not the problem: this server refuses us.
+                replacement = await requestToken(cancellationToken)
+                    .ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
             {
                 return false;
             }
+
+            if (replacement is null ||
+                string.IsNullOrWhiteSpace(replacement.Token) ||
+                !IsUsable(replacement) ||
+                string.Equals(
+                    replacement.Token,
+                    rejectedToken,
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _tokens[key] = replacement;
+            return true;
+        }
+        finally
+        {
+            _refreshLock.Release();
         }
     }
+
+    private static bool IsUsable(Entry entry)
+    {
+        return !string.IsNullOrWhiteSpace(entry.Token) &&
+               entry.Expiration > DateTime.UtcNow.Add(ExpirySafetyWindow);
+    }
+
+    internal sealed record Entry(string? Token, DateTime Expiration);
 }

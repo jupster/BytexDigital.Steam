@@ -1,3 +1,7 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
 using BytexDigital.Steam.ContentDelivery;
 using BytexDigital.Steam.Core.Structs;
 
@@ -156,5 +160,112 @@ public class CdnAuthTokenCacheTests
 
         Assert.Null(cache.Get(Depot, "other.example.com"));
         Assert.Null(cache.Get(new DepotId(1), Host));
+    }
+
+    [Fact]
+    public void GetToken_WhenMissing_ReturnsNull()
+    {
+        var cache = new CdnAuthTokenCache();
+
+        Assert.Null(cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenNoTokenExists_StoresReplacement()
+    {
+        var cache = new CdnAuthTokenCache();
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            rejectedToken: null,
+            _ => Task.FromResult<CdnAuthTokenCache.Entry?>(
+                Token("token-1")),
+            CancellationToken.None);
+
+        Assert.True(refreshed);
+        Assert.Equal("token-1", cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenCachedTokenWasRejected_RequestsReplacement()
+    {
+        var cache = new CdnAuthTokenCache();
+
+        await cache.RefreshAsync(
+            Key,
+            rejectedToken: null,
+            _ => Task.FromResult<CdnAuthTokenCache.Entry?>(
+                Token("old-token")),
+            CancellationToken.None);
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            rejectedToken: "old-token",
+            _ => Task.FromResult<CdnAuthTokenCache.Entry?>(
+                Token("new-token")),
+            CancellationToken.None);
+
+        Assert.True(refreshed);
+        Assert.Equal("new-token", cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenAnotherWorkerAlreadyRefreshed_ReusesToken()
+    {
+        var cache = new CdnAuthTokenCache();
+        var providerCalled = false;
+
+        await cache.RefreshAsync(
+            Key,
+            rejectedToken: null,
+            _ => Task.FromResult<CdnAuthTokenCache.Entry?>(
+                Token("new-token")),
+            CancellationToken.None);
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            rejectedToken: "old-token",
+            _ =>
+            {
+                providerCalled = true;
+                return Task.FromResult<CdnAuthTokenCache.Entry?>(null);
+            },
+            CancellationToken.None);
+
+        Assert.True(refreshed);
+        Assert.False(providerCalled);
+        Assert.Equal("new-token", cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenProviderReturnsRejectedToken_ReturnsFalse()
+    {
+        var cache = new CdnAuthTokenCache();
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            rejectedToken: "rejected-token",
+            _ => Task.FromResult<CdnAuthTokenCache.Entry?>(
+                Token("rejected-token")),
+            CancellationToken.None);
+
+        Assert.False(refreshed);
+        Assert.Null(cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenProviderFails_ReturnsFalse()
+    {
+        var cache = new CdnAuthTokenCache();
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            rejectedToken: "old-token",
+            _ => Task.FromException<CdnAuthTokenCache.Entry?>(
+                new InvalidOperationException("Token request failed.")),
+            CancellationToken.None);
+
+        Assert.False(refreshed);
+        Assert.Null(cache.GetToken(Key));
     }
 }

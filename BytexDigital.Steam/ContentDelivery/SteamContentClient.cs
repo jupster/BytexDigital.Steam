@@ -55,9 +55,8 @@ public class SteamContentClient : IAsyncDisposable
     internal SteamKit.SteamUnifiedMessages SteamUnifiedMessagesService { get; }
     internal int MaxConcurrentDownloadsPerTask { get; }
 
-    // CDN auth tokens, one per depot and host. Only country-specific CDNs ask for them.
-    internal ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken> CdnAuthenticationTokens { get; } = new();
-    private readonly AsyncLock _cdnTokenLock = new();
+    // CDN token caching and refresh coordination.
+    private readonly CdnAuthTokenCache _cdnAuthTokenCache = new();
 
     public SteamContentClient(SteamClient steamClient, int maxConcurrentDownloadsPerTask = 10)
     {
@@ -211,12 +210,20 @@ public class SteamContentClient : IAsyncDisposable
         return serverPool;
     }
 
-    private static string CdnKey(DepotId depotId, Server server) => $"{depotId.Id}:{server.Host}";
+    private static string CdnKey(DepotId depotId, string host) =>
+        $"{depotId.Id}:{host}";
 
     // The cached token for this depot on this server, or null if the server never asked for one
     internal string? GetCdnAuthToken(DepotId depotId, Server server)
     {
-        return CdnAuthenticationTokens.TryGetValue(CdnKey(depotId, server), out var auth) ? auth.Token : null;
+        var host = server.Host;
+
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return null;
+        }
+
+        return _cdnAuthTokenCache.GetToken(CdnKey(depotId, host));
     }
 
     /// <summary>
@@ -238,36 +245,30 @@ public class SteamContentClient : IAsyncDisposable
             return false;
         }
 
-        var key = $"{depotId.Id}:{host}";
-
         // One request at a time, so many workers failing together only ask Steam once
-        using var lk = await _cdnTokenLock.LockAsync(cancellationToken);
-
-        if (CdnAuthenticationTokens.TryGetValue(key, out var existing) &&
-            existing.Expiration > DateTime.UtcNow.AddMinutes(1))
-        {
             // A valid token that is not the rejected one means another worker already refreshed it.
             // The rejected token itself still being valid means the token is not the problem: this server refuses us.
-            return existing.Token != rejectedToken;
-        }
-
-        try
-        {
-            var auth = await SteamClient._steamContentHandler.GetCDNAuthToken(appId, depotId, host)
-                .WaitAsync(cancellationToken);
-
-            if (auth.Result != SteamKit.EResult.OK)
+        return await _cdnAuthTokenCache.RefreshAsync(
+            CdnKey(depotId, host),
+            rejectedToken,
+            async tokenCancellationToken =>
             {
-                return false;
-            }
+                var auth = await SteamClient._steamContentHandler
+                    .GetCDNAuthToken(appId, depotId, host)
+                    .WaitAsync(tokenCancellationToken)
+                    .ConfigureAwait(false);
 
-            CdnAuthenticationTokens[key] = auth;
-            return true;
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            return false;
-        }
+                if (auth.Result != SteamKit.EResult.OK ||
+                    string.IsNullOrWhiteSpace(auth.Token))
+                {
+                    return null;
+                }
+
+                return new CdnAuthTokenCache.Entry(
+                    auth.Token,
+                    auth.Expiration);
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
