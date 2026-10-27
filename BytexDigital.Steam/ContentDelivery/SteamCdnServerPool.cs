@@ -63,8 +63,6 @@ namespace BytexDigital.Steam.ContentDelivery
 
         public Server GetServer(CancellationToken cancellationToken = default)
         {
-            // Stops waiting when the caller cancels OR when the pool is closed or gives up
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _token);
             Server? server;
 
             do
@@ -76,6 +74,9 @@ namespace BytexDigital.Steam.ContentDelivery
                         Logger?.LogTrace("GetServer: Set populatePoolEvent");
                         _populatePoolEvent.Set();
                     }
+
+                    // Stops waiting when the caller cancels OR when the pool is closed or gives up
+                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _token);
 
                     try
                     {
