@@ -45,7 +45,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public DepotId DepotId { get; }
         public ManifestId ManifestId { get; }
         public DownloadHandlerStateEnum State { get; protected set; }
-	public string DownloadDirectory { get; protected set; } = null!;
+        public string DownloadDirectory { get; protected set; } = null!;
         public Func<ManifestFile, bool> FileCondition { get; protected set; } = null!;
 
         public ILogger? Logger { get; set; }
