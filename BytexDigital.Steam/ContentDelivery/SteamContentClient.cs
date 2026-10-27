@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Net;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -53,6 +54,10 @@ public class SteamContentClient : IAsyncDisposable
     internal SteamKit.SteamApps SteamApps { get; }
     internal SteamKit.SteamUnifiedMessages SteamUnifiedMessagesService { get; }
     internal int MaxConcurrentDownloadsPerTask { get; }
+
+    // CDN auth tokens, one per depot and host. Only country-specific CDNs ask for them.
+    internal ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken> CdnAuthenticationTokens { get; } = new();
+    private readonly AsyncLock _cdnTokenLock = new();
 
     public SteamContentClient(SteamClient steamClient, int maxConcurrentDownloadsPerTask = 10)
     {
@@ -120,11 +125,13 @@ public class SteamContentClient : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
 
             Server? server = null;
+            string? cdnAuthToken = null;
             var healthy = false;
 
             try
             {
                 server = pool.GetServer(cancellationToken);
+                cdnAuthToken = GetCdnAuthToken(depotId, server);
 
                 var depotKey = await GetDepotKeyAsync(depotId, appId);
 
@@ -133,7 +140,9 @@ public class SteamContentClient : IAsyncDisposable
                         .WaitAsync(cancellationToken);
 
                 var manifest =
-                    await pool.CdnClient.DownloadManifestAsync(depotId, manifestId, manifestCode, server, depotKey)
+                    await pool.CdnClient.DownloadManifestAsync(
+                            depotId, manifestId, manifestCode, server, depotKey, pool.DesignatedProxyServer,
+                            cdnAuthToken: cdnAuthToken)
                         .WaitAsync(cancellationToken);
 
                 if (manifest.FilenamesEncrypted)
@@ -151,6 +160,14 @@ public class SteamContentClient : IAsyncDisposable
             catch (Exception ex)
             {
                 lastException = ex;
+
+                // A 403 from a CDN server means it wants an auth token, or ours expired.
+                // The finally block keeps the server only if a retry can work.
+                if (server is { Type: "CDN" } &&
+                    ex is SteamKit.SteamKitWebRequestException { StatusCode: HttpStatusCode.Forbidden })
+                {
+                    healthy = await RefreshCdnAuthTokenAsync(appId, depotId, server, cdnAuthToken, cancellationToken);
+                }
             }
             finally
             {
@@ -192,6 +209,65 @@ public class SteamContentClient : IAsyncDisposable
         _serverPools[appId] = serverPool;
 
         return serverPool;
+    }
+
+    private static string CdnKey(DepotId depotId, Server server) => $"{depotId.Id}:{server.Host}";
+
+    // The cached token for this depot on this server, or null if the server never asked for one
+    internal string? GetCdnAuthToken(DepotId depotId, Server server)
+    {
+        return CdnAuthenticationTokens.TryGetValue(CdnKey(depotId, server), out var auth) ? auth.Token : null;
+    }
+
+    /// <summary>
+    ///     Called after a CDN server answered 403. Returns true if the request is worth retrying on this server
+    ///     (a new token is available), false if the server should be dropped.
+    /// </summary>
+    internal async Task<bool> RefreshCdnAuthTokenAsync(
+        AppId appId,
+        DepotId depotId,
+        Server server,
+        string? rejectedToken,
+        CancellationToken cancellationToken)
+    {
+        var host = server.Host;
+
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            // A CDN authentication token cannot be requested without a host name.
+            return false;
+        }
+
+        var key = $"{depotId.Id}:{host}";
+
+        // One request at a time, so many workers failing together only ask Steam once
+        using var lk = await _cdnTokenLock.LockAsync(cancellationToken);
+
+        if (CdnAuthenticationTokens.TryGetValue(key, out var existing) &&
+            existing.Expiration > DateTime.UtcNow.AddMinutes(1))
+        {
+            // A valid token that is not the rejected one means another worker already refreshed it.
+            // The rejected token itself still being valid means the token is not the problem: this server refuses us.
+            return existing.Token != rejectedToken;
+        }
+
+        try
+        {
+            var auth = await SteamClient._steamContentHandler.GetCDNAuthToken(appId, depotId, host)
+                .WaitAsync(cancellationToken);
+
+            if (auth.Result != SteamKit.EResult.OK)
+            {
+                return false;
+            }
+
+            CdnAuthenticationTokens[key] = auth;
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
     }
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)

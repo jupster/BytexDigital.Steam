@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Net;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -470,10 +471,12 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             cancellationToken.ThrowIfCancellationRequested();
 
             Server? server = null;
+            string? cdnAuthToken = null;
 
             try
             {
                 server = serverPool.GetServer(cancellationToken);
+                cdnAuthToken = ContentClient.GetCdnAuthToken(DepotId, server);
 
                 writtenBytes = await serverPool.CdnClient.DownloadDepotChunkAsync(
                     DepotId,
@@ -481,7 +484,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     server,
                     downloadedData,
                     depotKey,
-                    serverPool.DesignatedProxyServer)
+                    serverPool.DesignatedProxyServer,
+                    cdnAuthToken)
                     .ConfigureAwait(false);
 
                 serverPool.ReturnServer(server, false);
@@ -503,7 +507,25 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             {
                 if (server != null)
                 {
-                    serverPool.ReturnServer(server, true);
+                    // A 403 from a CDN server means it wants an auth token, or ours expired.
+                    // Keep the server only if a retry can work.
+                    var forbidden = server.Type == "CDN" &&
+                                    ex is SteamKit2.SteamKitWebRequestException { StatusCode: HttpStatusCode.Forbidden };
+
+                    var retryable = forbidden &&
+                                    await ContentClient.RefreshCdnAuthTokenAsync(AppId, DepotId, server, cdnAuthToken, cancellationToken)
+                                        .ConfigureAwait(false);
+
+                    if (forbidden)
+                    {
+                        Logger?.LogWarning(
+                            "CDN server {Host} answered 403 for depot {DepotId}: {Outcome}.",
+                            server.Host,
+                            DepotId,
+                            retryable ? "retrying with an auth token" : "dropping the server");
+                    }
+
+                    serverPool.ReturnServer(server, !retryable);
                 }
 
                 Logger?.LogWarning(
