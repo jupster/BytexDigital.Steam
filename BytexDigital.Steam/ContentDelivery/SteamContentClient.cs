@@ -538,9 +538,8 @@ public class SteamContentClient : IAsyncDisposable
             var depotId = uint.Parse(depot.Name!);
 
             // Collect data
-            var name = depot["name"].Value
-                ?? throw new InvalidOperationException(
-                    "A depot is missing its name.");
+            // The name is only informational, and some depots in Steam's data have none
+            var name = depot["name"].Value ?? $"Depot {depotId}";
             var maxSize = depot["maxsize"].AsUnsignedLong();
             var isSharedInstall = depot["sharedinstall"].AsBoolean();
             var depotFromApp = (AppId?) depot["depotfromapp"].AsUnsignedInteger();
