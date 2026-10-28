@@ -10,13 +10,19 @@ internal sealed class CdnAuthTokenCache
     private static readonly TimeSpan ExpirySafetyWindow =
         TimeSpan.FromMinutes(1);
 
-    /// <summary>
-    ///     Holds CDN auth tokens, one per depot and host, and decides when a 403 is worth retrying.
-    /// </summary>
-        // A token this close to expiring is treated as already expired
     private readonly ConcurrentDictionary<string, Entry> _tokens = new();
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private readonly Func<DateTime> _utcNow;
 
+    internal CdnAuthTokenCache(Func<DateTime>? utcNow = null)
+    {
+        _utcNow = utcNow ?? (() => DateTime.UtcNow);
+    }
+
+    /// <summary>
+    /// Gets a usable token for the specified cache key.
+    /// Returns null if no usable token is cached.
+    /// </summary>
     internal string? GetToken(string key)
     {
         return _tokens.TryGetValue(key, out var entry) && IsUsable(entry)
@@ -24,6 +30,45 @@ internal sealed class CdnAuthTokenCache
             : null;
     }
 
+    internal async Task<bool> InvalidateIfTokenMatchesAsync(
+        string key,
+        string? rejectedToken,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+
+        if (string.IsNullOrWhiteSpace(rejectedToken))
+        {
+            return false;
+        }
+
+        await _refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (_tokens.TryGetValue(key, out var existing) &&
+                string.Equals(
+                    existing.Token,
+                    rejectedToken,
+                    StringComparison.Ordinal))
+            {
+                return _tokens.TryRemove(key, out _);
+            }
+
+            // A newer token may have replaced the rejected one.
+            return false;
+        }
+        finally
+        {
+            _refreshLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Attempts to refresh a CDN authentication token after a failed request.
+    /// Returns true when a usable replacement token is available.
+    /// Returns false when the server should not be retried with this cache state.
+    /// </summary>
     internal async Task<bool> RefreshAsync(
         string key,
         string? rejectedToken,
@@ -33,14 +78,15 @@ internal sealed class CdnAuthTokenCache
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         ArgumentNullException.ThrowIfNull(requestToken);
 
-        await _refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _refreshLock
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        // The cached token for this depot on this host, or null if the server never asked for one
         try
         {
             if (_tokens.TryGetValue(key, out var existing))
             {
-                // Another worker has already replaced the rejected token.
+                // Another worker may already have refreshed the rejected token.
                 if (IsUsable(existing) &&
                     !string.Equals(
                         existing.Token,
@@ -50,20 +96,14 @@ internal sealed class CdnAuthTokenCache
                     return true;
                 }
 
-        /// <summary>
-        ///     Called after a CDN server answered 403. Returns true if retrying on this server is worthwhile,
-        ///     false if the server should be dropped.
-        /// </summary>
+                // Remove an expired token or the token that was rejected.
                 _tokens.TryRemove(key, out _);
             }
 
-            // One request at a time, so many workers failing together only ask Steam once
             Entry? replacement;
 
             try
             {
-                // A valid token that is not the rejected one means another worker already refreshed it.
-                // The rejected token itself still being valid means the token is not the problem: this server refuses us.
                 replacement = await requestToken(cancellationToken)
                     .ConfigureAwait(false);
             }
@@ -73,9 +113,12 @@ internal sealed class CdnAuthTokenCache
             }
             catch
             {
+                // Refresh failed; the caller can try another server.
                 return false;
             }
 
+            // Never retry with a missing, expired, nearly expired,
+            // or unchanged replacement token.
             if (replacement is null ||
                 string.IsNullOrWhiteSpace(replacement.Token) ||
                 !IsUsable(replacement) ||
@@ -96,10 +139,10 @@ internal sealed class CdnAuthTokenCache
         }
     }
 
-    private static bool IsUsable(Entry entry)
+    private bool IsUsable(Entry entry)
     {
         return !string.IsNullOrWhiteSpace(entry.Token) &&
-               entry.Expiration > DateTime.UtcNow.Add(ExpirySafetyWindow);
+               entry.Expiration > _utcNow().Add(ExpirySafetyWindow);
     }
 
     internal sealed record Entry(string? Token, DateTime Expiration);

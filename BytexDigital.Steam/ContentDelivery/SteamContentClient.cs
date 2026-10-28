@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics.CodeAnalysis;
+using Microsoft.Extensions.Logging;
 using BytexDigital.Steam.ContentDelivery.Exceptions;
 using BytexDigital.Steam.ContentDelivery.Models;
 using BytexDigital.Steam.ContentDelivery.Models.Downloading;
@@ -48,6 +49,8 @@ public class SteamContentClient : IAsyncDisposable
 
     public CancellationToken CancellationToken => _cancellationTokenSource.Token;
     public SteamClient SteamClient { get; }
+
+    public ILogger? Logger { get; set; }
 
     internal SteamKit.Internal.PublishedFile PublishedFileService { get; }
     internal SteamKit.SteamUser SteamUser { get; }
@@ -118,19 +121,32 @@ public class SteamContentClient : IAsyncDisposable
         const int maxAttempts = 5;
 
         Exception? lastException = null;
+        Server? serverForAuthRetry = null;
 
-        while (attempts < maxAttempts && !cancellationToken.IsCancellationRequested)
+        while (attempts < maxAttempts)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // Keep a server checked out while its replacement-token retry is pending.
+            Server? server = serverForAuthRetry;
+            var retryingWithReplacementToken = server != null;
+            var retainServerForRetry = false;
+            serverForAuthRetry = null;
 
-            Server? server = null;
             string? cdnAuthToken = null;
             var healthy = false;
 
             try
             {
-                server = pool.GetServer(cancellationToken);
-                cdnAuthToken = GetCdnAuthToken(depotId, server);
+                cancellationToken.ThrowIfCancellationRequested();
+                server ??= pool.GetServer(cancellationToken);
+                cdnAuthToken = await GetCdnAuthTokenForDownloadAsync(
+                    appId,
+                    depotId,
+                    server,
+                    cancellationToken).ConfigureAwait(false);
+
+                Logger?.LogDebug(
+                    "Manifest {ManifestId} of depot {DepotId}: attempt {Attempt} of {MaxAttempts} via {Host} ({Type}), auth token: {HasToken}.",
+                    manifestId, depotId, attempts + 1, maxAttempts, server.Host, server.Type, cdnAuthToken != null);
 
                 var depotKey = await GetDepotKeyAsync(depotId, appId);
 
@@ -150,7 +166,15 @@ public class SteamContentClient : IAsyncDisposable
                 }
 
                 healthy = true;
+                Logger?.LogDebug("Manifest {ManifestId} of depot {DepotId} downloaded via {Host}.", manifestId, depotId, server.Host);
                 return manifest;
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                // Cancellation is not evidence that the server is faulty.
+                healthy = true;
+                throw;
             }
             catch (Exception ex) when (ex is SteamAccessDeniedException or SteamNoContentServerFoundException)
             {
@@ -160,18 +184,61 @@ public class SteamContentClient : IAsyncDisposable
             {
                 lastException = ex;
 
-                // A 403 from a CDN server means it wants an auth token, or ours expired.
-                // The finally block keeps the server only if a retry can work.
-                if (server is { Type: "CDN" } &&
-                    ex is SteamKit.SteamKitWebRequestException { StatusCode: HttpStatusCode.Forbidden })
+                Logger?.LogWarning(
+                    ex,
+                    "Manifest {ManifestId} of depot {DepotId} failed via {Host} on attempt {Attempt} ({Status}).",
+                    manifestId, depotId, server?.Host, attempts + 1,
+                    (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
+
+                // A CDN gets one authentication-recovery attempt per download sequence.
+                // Keep it checked out while we retry using the replacement token.
+                if (server is not null)
                 {
-                    healthy = await RefreshCdnAuthTokenAsync(appId, depotId, server, cdnAuthToken, cancellationToken);
+                    CdnAuthRecoveryAction recoveryAction;
+
+                    try
+                    {
+                        recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
+                            isCdnServer: server.Type == "CDN",
+                            isForbidden: ex is SteamKit.SteamKitWebRequestException
+                                { StatusCode: HttpStatusCode.Forbidden },
+                            retryingWithReplacementToken: retryingWithReplacementToken,
+                            canRetry: attempts + 1 < maxAttempts,
+                            refreshTokenAsync: tokenCancellationToken =>
+                                RefreshCdnAuthTokenAsync(
+                                    appId,
+                                    depotId,
+                                    server,
+                                    cdnAuthToken,
+                                    tokenCancellationToken),
+                        invalidateRejectedTokenAsync: async tokenCancellationToken =>
+                        {
+                            await InvalidateCdnAuthTokenIfMatchesAsync(
+                                depotId,
+                                server,
+                                cdnAuthToken,
+                                tokenCancellationToken).ConfigureAwait(false);
+                        },
+                        cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                        when (cancellationToken.IsCancellationRequested)
+                    {
+                        healthy = true;
+                        throw;
+                    }
+
+                    if (recoveryAction == CdnAuthRecoveryAction.RetrySameServer)
+                    {
+                        serverForAuthRetry = server;
+                        retainServerForRetry = true;
+                    }
                 }
             }
             finally
             {
                 // A server that just worked goes back in the pool. Only one that failed is dropped.
-                if (server != null)
+                if (server != null && !retainServerForRetry)
                 {
                     pool.ReturnServer(server, !healthy);
                 }
@@ -204,7 +271,7 @@ public class SteamContentClient : IAsyncDisposable
             serverPool.Dispose();
         }
 
-        serverPool = new SteamCdnServerPool(this, appId);
+        serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
         _serverPools[appId] = serverPool;
 
         return serverPool;
@@ -226,6 +293,76 @@ public class SteamContentClient : IAsyncDisposable
         return _cdnAuthTokenCache.GetToken(CdnKey(depotId, host));
     }
 
+    internal async Task<string?> GetCdnAuthTokenForDownloadAsync(
+        AppId appId,
+        DepotId depotId,
+        Server server,
+        CancellationToken cancellationToken)
+    {
+        var token = GetCdnAuthToken(depotId, server);
+
+        // Reuse any valid cached token.
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            return token;
+        }
+
+        // Proactively request a token for China-only CDN servers.
+        // This is best-effort because SteamChinaOnly does not
+        // guarantee that the server requires token authentication.
+        if (server.Type != "CDN" || !server.SteamChinaOnly)
+        {
+            return null;
+        }
+
+        var refreshed = await RefreshCdnAuthTokenAsync(
+            appId,
+            depotId,
+            server,
+            rejectedToken: null,
+            cancellationToken).ConfigureAwait(false);
+
+        if (refreshed)
+        {
+            return GetCdnAuthToken(depotId, server);
+        }
+
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            Logger?.LogDebug(
+                "CDN auth for depot {DepotId} via {Host}: proactive token acquisition succeeded.",
+                depotId, server.Host);
+
+            return token;
+        }
+
+        Logger?.LogDebug(
+            "CDN auth for depot {DepotId} via {Host}: no usable token obtained proactively; continuing with normal request and recovery handling.",
+            depotId, server.Host);
+
+        return null;
+    }
+
+    internal Task<bool> InvalidateCdnAuthTokenIfMatchesAsync(
+        DepotId depotId,
+        Server server,
+        string? rejectedToken,
+        CancellationToken cancellationToken)
+    {
+        var host = server.Host;
+
+        if (string.IsNullOrWhiteSpace(host) ||
+            string.IsNullOrWhiteSpace(rejectedToken))
+        {
+            return Task.FromResult(false);
+        }
+
+        return _cdnAuthTokenCache.InvalidateIfTokenMatchesAsync(
+            CdnKey(depotId, host),
+            rejectedToken,
+            cancellationToken);
+    }
+
     /// <summary>
     ///     Called after a CDN server answered 403. Returns true if the request is worth retrying on this server
     ///     (a new token is available), false if the server should be dropped.
@@ -245,31 +382,63 @@ public class SteamContentClient : IAsyncDisposable
             return false;
         }
 
-        // One request at a time, so many workers failing together only ask Steam once
-            // A valid token that is not the rejected one means another worker already refreshed it.
-            // The rejected token itself still being valid means the token is not the problem: this server refuses us.
+        // One request at a time, so many workers failing together only ask Steam once.
+        // A valid token that is not the rejected one means another worker already refreshed it.
         return await _cdnAuthTokenCache.RefreshAsync(
             CdnKey(depotId, host),
             rejectedToken,
             async tokenCancellationToken =>
             {
-                var auth = await SteamClient._steamContentHandler
-                    .GetCDNAuthToken(appId, depotId, host)
-                    .WaitAsync(tokenCancellationToken)
-                    .ConfigureAwait(false);
+                try
+			    {
+                    var auth = await SteamClient._steamContentHandler
+                        .GetCDNAuthToken(appId, depotId, host)
+                        .WaitAsync(tokenCancellationToken)
+                        .ConfigureAwait(false);
 
-                if (auth.Result != SteamKit.EResult.OK ||
-                    string.IsNullOrWhiteSpace(auth.Token))
-                {
-                    return null;
+                    var hasToken = !string.IsNullOrWhiteSpace(auth.Token);
+
+                    if (auth.Result != SteamKit.EResult.OK || !hasToken)
+                    {
+                        Logger?.LogWarning(
+                            "CDN auth refresh for depot {DepotId} via {Host} failed: Steam result {Result}; token returned: {HasToken}.",
+                            depotId,
+                            host,
+                            auth.Result,
+                            hasToken);
+
+                        return null;
+                    }
+
+                    Logger?.LogDebug(
+                        "CDN auth refresh for depot {DepotId} via {Host}: Steam result {Result}; token returned: {HasToken}; expiration: {Expiration}.",
+                        depotId,
+                        host,
+                        auth.Result,
+                        hasToken,
+                        auth.Expiration);
+
+                    return new CdnAuthTokenCache.Entry(
+                        auth.Token,
+                        auth.Expiration);
                 }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Logger?.LogWarning(
+                        ex,
+                        "CDN auth refresh request for depot {DepotId} via {Host} threw an exception.",
+                        depotId,
+                        host);
 
-                return new CdnAuthTokenCache.Entry(
-                    auth.Token,
-                    auth.Expiration);
+                    throw;
+                }
             },
             cancellationToken).ConfigureAwait(false);
-    }
+	}
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
     {

@@ -96,6 +96,7 @@ namespace BytexDigital.Steam.ContentDelivery
         {
             if (isFaulty)
             {
+                Logger?.LogDebug("CDN server {Host} ({Type}) dropped from the pool.", server.Host, server.Type);
                 return;
             }
 
@@ -159,10 +160,16 @@ namespace BytexDigital.Steam.ContentDelivery
                                 })
                             .OrderBy(x => x.WeightedLoad);
 
+                        var added = 0;
                         foreach (var server in sortedServers)
                         {
                             _availableServerEndpoints.Add(server);
+                            added++;
                         }
+
+                        Logger?.LogDebug(
+                            "CDN pool for app {AppId} populated: {Added} of {Total} servers usable.",
+                            _appId, added, servers.Count);
                     }
 
                     Logger?.LogTrace("MonitorAsync: Notifying that pool is populated");
