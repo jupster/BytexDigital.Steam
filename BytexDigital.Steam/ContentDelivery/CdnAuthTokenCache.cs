@@ -11,13 +11,18 @@ internal sealed class CdnAuthTokenCache
         TimeSpan.FromMinutes(1);
 
     private readonly ConcurrentDictionary<string, Entry> _tokens = new();
-    private readonly SemaphoreSlim _refreshLock = new(1, 1);
+
+    // One lock per key (depot + host), so a slow request for one CDN never holds up another
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _refreshLocks = new();
     private readonly Func<DateTime> _utcNow;
 
     internal CdnAuthTokenCache(Func<DateTime>? utcNow = null)
     {
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
     }
+
+    private SemaphoreSlim LockFor(string key) =>
+        _refreshLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
     /// <summary>
     /// Gets a usable token for the specified cache key.
@@ -42,7 +47,8 @@ internal sealed class CdnAuthTokenCache
             return false;
         }
 
-        await _refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var refreshLock = LockFor(key);
+        await refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
@@ -60,7 +66,7 @@ internal sealed class CdnAuthTokenCache
         }
         finally
         {
-            _refreshLock.Release();
+            refreshLock.Release();
         }
     }
 
@@ -78,7 +84,9 @@ internal sealed class CdnAuthTokenCache
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         ArgumentNullException.ThrowIfNull(requestToken);
 
-        await _refreshLock
+        var refreshLock = LockFor(key);
+
+        await refreshLock
             .WaitAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -135,7 +143,7 @@ internal sealed class CdnAuthTokenCache
         }
         finally
         {
-            _refreshLock.Release();
+            refreshLock.Release();
         }
     }
 

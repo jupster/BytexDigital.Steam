@@ -296,4 +296,33 @@ public class CdnAuthTokenCacheTests
         Assert.False(removed);
         Assert.Equal("newer-token", cache.GetToken(Key));
     }
+
+        [Fact]
+    public async Task RefreshAsync_DifferentKeysDoNotWaitForEachOther()
+    {
+        var cache = new CdnAuthTokenCache(() => Start);
+        var release = new TaskCompletionSource<CdnAuthTokenCache.Entry?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // This request stays in flight until the test lets it finish
+        var slow = cache.RefreshAsync(
+            "233781:slow.example.com", null, _ => release.Task, CancellationToken.None);
+
+        // With one shared lock this would hang and time out
+        var fast = await cache.RefreshAsync(
+                "233781:fast.example.com",
+                null,
+                _ => Task.FromResult<CdnAuthTokenCache.Entry?>(Token("fast-token")),
+                CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(fast);
+        Assert.False(slow.IsCompleted);
+        Assert.Equal("fast-token", cache.GetToken("233781:fast.example.com"));
+
+        release.SetResult(Token("slow-token"));
+
+        Assert.True(await slow);
+        Assert.Equal("slow-token", cache.GetToken("233781:slow.example.com"));
+    }
 }
