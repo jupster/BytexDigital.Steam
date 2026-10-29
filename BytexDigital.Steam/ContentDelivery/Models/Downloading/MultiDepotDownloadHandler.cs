@@ -27,9 +27,19 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public Func<ManifestFile, bool> FileCondition { get; protected set; } =null!;
         public DownloadHandlerStateEnum State { get; protected set; }
 
-        public double TotalProgress => _multipleFilesHandlers.Count == 0
-            ? 1
-            : _multipleFilesHandlers.Sum(x => x.TotalProgress) / _multipleFilesHandlers.Count;
+        public double TotalProgress
+        {
+            get
+            {
+                // Weighted by size, so a tiny depot finishing doesn't make a huge one look half done.
+                // With nothing to download there is nothing left to wait for.
+                var totalSize = TotalFileSize;
+                if (totalSize == 0)
+                    return 1;
+
+                return _multipleFilesHandlers.Sum(x => x.TotalProgress * x.TotalFileSize) / totalSize;
+            }
+        }
         public int TotalFileCount => _multipleFilesHandlers.Sum(x => x.TotalFileCount);
         public ulong TotalFileSize => _multipleFilesHandlers.Aggregate(
             0UL,

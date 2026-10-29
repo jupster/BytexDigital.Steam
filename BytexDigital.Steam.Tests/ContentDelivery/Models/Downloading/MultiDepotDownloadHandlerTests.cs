@@ -122,15 +122,19 @@ public class MultiDepotDownloadHandlerTests
 
         public FakeDownloadHandler(
             Exception? verificationException = null,
-            Exception? downloadException = null)
+            Exception? downloadException = null,
+            double progress = 0.5,
+            ulong size = 100UL)
         {
             _verificationException = verificationException;
             _downloadException = downloadException;
+            TotalProgress = progress;
+            TotalFileSize = size;
         }
 
-        public double TotalProgress => 0.5;
+        public double TotalProgress { get; }
         public int TotalFileCount => 1;
-        public ulong TotalFileSize => 100UL;
+        public ulong TotalFileSize { get; }
 
         public string DownloadDirectory { get; private set; } = string.Empty;
 
@@ -211,5 +215,30 @@ public class MultiDepotDownloadHandlerTests
         public void Dispose()
         {
         }
+    }
+
+    [Fact]
+    public void TotalProgress_IsWeightedBySize()
+    {
+        var small = new FakeDownloadHandler(progress: 1.0, size: 10UL);
+        var large = new FakeDownloadHandler(progress: 0.0, size: 90UL);
+
+        var handler = new MultiDepotDownloadHandler(
+            new List<IDownloadHandler> { small, large });
+
+        // A plain average would say 0.5
+        Assert.Equal(0.1, handler.TotalProgress, 3);
+    }
+
+    [Fact]
+    public void TotalProgress_IgnoresDepotsWithNothingToDownload()
+    {
+        var nothing = new FakeDownloadHandler(progress: 0.0, size: 0UL);
+        var done = new FakeDownloadHandler(progress: 1.0, size: 100UL);
+
+        var handler = new MultiDepotDownloadHandler(
+            new List<IDownloadHandler> { nothing, done });
+
+        Assert.Equal(1.0, handler.TotalProgress, 3);
     }
 }
