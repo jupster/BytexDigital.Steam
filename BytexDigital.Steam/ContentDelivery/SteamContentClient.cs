@@ -327,15 +327,6 @@ public class SteamContentClient : IAsyncDisposable
             return GetCdnAuthToken(depotId, server);
         }
 
-        if (!string.IsNullOrWhiteSpace(token))
-        {
-            Logger?.LogDebug(
-                "CDN auth for depot {DepotId} via {Host}: proactive token acquisition succeeded.",
-                depotId, server.Host);
-
-            return token;
-        }
-
         Logger?.LogDebug(
             "CDN auth for depot {DepotId} via {Host}: no usable token obtained proactively; continuing with normal request and recovery handling.",
             depotId, server.Host);

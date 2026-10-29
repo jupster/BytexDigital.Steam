@@ -494,7 +494,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     server,
                     cancellationToken).ConfigureAwait(false);
 
-
                 Logger?.LogDebug(
                     "Chunk {ChunkId} in file {FileName}, depot {DepotId}: attempt {Attempt} of {MaxAttempts} via {Host} ({Type}, China-only: {ChinaOnly}), auth token supplied: {HasToken}.",
                     chunkJob.InternalChunk.ChunkID,
@@ -546,8 +545,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 if (server != null)
                 {
                     var forbidden = server.Type == "CDN" &&
-                                    ex is SteamKit2.SteamKitWebRequestException
-                                        { StatusCode: HttpStatusCode.Forbidden };
+                        ex is SteamKit2.SteamKitWebRequestException
+                            { StatusCode: HttpStatusCode.Forbidden };
 
                     CdnAuthRecoveryAction recoveryAction;
 
@@ -555,46 +554,16 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     {
                         recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
                             isCdnServer: server.Type == "CDN",
-                            isForbidden: ex is SteamKit2.SteamKitWebRequestException
-                                { StatusCode: HttpStatusCode.Forbidden },
+                            isForbidden: forbidden,
                             retryingWithReplacementToken: retryingWithReplacementToken,
                             canRetry: attempt < maxAttempts,
-                            refreshTokenAsync: async tokenCancellationToken =>
-                            {
-                                Logger?.LogWarning(
-                                    "TEST DIAGNOSTIC: Starting CDN auth refresh for depot {DepotId} via {Host}; token supplied: {HasToken}.",
+                            refreshTokenAsync: tokenCancellationToken =>
+                                ContentClient.RefreshCdnAuthTokenAsync(
+                                    AppId,
                                     DepotId,
-                                    server.Host,
-                                    !string.IsNullOrWhiteSpace(cdnAuthToken));
-
-                                try
-                                {
-                                    var refreshed = await ContentClient.RefreshCdnAuthTokenAsync(
-                                        AppId,
-                                        DepotId,
-                                        server,
-                                        cdnAuthToken,
-                                        tokenCancellationToken).ConfigureAwait(false);
-
-                                    Logger?.LogWarning(
-                                        "TEST DIAGNOSTIC: CDN auth refresh for depot {DepotId} via {Host} returned {RefreshSucceeded}.",
-                                        DepotId,
-                                        server.Host,
-                                        refreshed);
-
-                                    return refreshed;
-                                }
-                                catch (Exception ex)
-                                {
-                                    Logger?.LogWarning(
-                                        ex,
-                                        "TEST DIAGNOSTIC: CDN auth refresh for depot {DepotId} via {Host} threw an exception.",
-                                        DepotId,
-                                        server.Host);
-
-                                    throw;
-                                }
-                            },
+                                    server,
+                                    cdnAuthToken,
+                                    tokenCancellationToken),
                             invalidateRejectedTokenAsync: async tokenCancellationToken =>
                             {
                                 await ContentClient.InvalidateCdnAuthTokenIfMatchesAsync(
