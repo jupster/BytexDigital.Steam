@@ -78,8 +78,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 State = DownloadHandlerStateEnum.Downloading;
 
-                Directory.CreateDirectory(DownloadDirectory);
                 path = DownloadPathHelper.GetSafePath(DownloadDirectory, FileName);
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
                 using var response = await Http
                     .GetAsync(FileUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
